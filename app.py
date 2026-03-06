@@ -23,6 +23,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 
+# streamlit-autorefresh per polling reale (pip install streamlit-autorefresh)
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
+
 # ─────────────────────────────────────────────
 #  PAGE CONFIG
 # ─────────────────────────────────────────────
@@ -303,32 +310,108 @@ ALL_REGIONS = sorted(REGIONS_COORDS.keys())
 
 # ─────────────────────────────────────────────
 #  NEWS / ATTACK FEED SOURCES
+#  Polling ogni 60s — tutti i feed con aggiornamento frequente
 # ─────────────────────────────────────────────
 FEED_SOURCES = [
+    # ── RANSOMWARE / DARKWEB ──────────────────
     {
         "name": "Ransomware.live",
         "url": "https://www.ransomware.live/rss.xml",
         "type": "ransomware",
+        "italian_only": False,
     },
+    {
+        "name": "Ransomwatch",
+        "url": "https://ransomwatch.telemetry.ltd/rss.xml",
+        "type": "ransomware",
+        "italian_only": False,
+    },
+    # ── CERT / GOV ITALIANI ───────────────────
     {
         "name": "CERT-AgID",
         "url": "https://cert-agid.gov.it/feed/",
         "type": "cert",
+        "italian_only": True,
     },
+    {
+        "name": "CSIRT Italia",
+        "url": "https://www.csirt.gov.it/feed",
+        "type": "cert",
+        "italian_only": True,
+    },
+    # ── MEDIA ITALIANI CYBER ──────────────────
     {
         "name": "Red Hot Cyber",
         "url": "https://www.redhotcyber.com/feed/",
         "type": "news",
+        "italian_only": True,
     },
     {
         "name": "Cybersecurity360",
         "url": "https://www.cybersecurity360.it/feed/",
         "type": "news",
+        "italian_only": True,
     },
     {
-        "name": "DarkReading Italy",
+        "name": "AgendaDigitale",
+        "url": "https://www.agendadigitale.eu/feed/",
+        "type": "news",
+        "italian_only": True,
+    },
+    {
+        "name": "Sicurezza Nazionale",
+        "url": "https://www.sicurezzanazionale.gov.it/sisr.nsf/feed.rss",
+        "type": "cert",
+        "italian_only": True,
+    },
+    {
+        "name": "Punto Informatico",
+        "url": "https://www.punto-informatico.it/feed/",
+        "type": "news",
+        "italian_only": True,
+    },
+    # ── MEDIA INTERNAZIONALI (filtrati per IT) ─
+    {
+        "name": "The Hacker News",
+        "url": "https://feeds.feedburner.com/TheHackersNews",
+        "type": "news",
+        "italian_only": False,
+    },
+    {
+        "name": "BleepingComputer",
+        "url": "https://www.bleepingcomputer.com/feed/",
+        "type": "news",
+        "italian_only": False,
+    },
+    {
+        "name": "Krebs on Security",
+        "url": "https://krebsonsecurity.com/feed/",
+        "type": "news",
+        "italian_only": False,
+    },
+    {
+        "name": "SecurityWeek",
+        "url": "https://feeds.feedburner.com/Securityweek",
+        "type": "news",
+        "italian_only": False,
+    },
+    {
+        "name": "DarkReading",
         "url": "https://www.darkreading.com/rss.xml",
         "type": "news",
+        "italian_only": False,
+    },
+    {
+        "name": "Recorded Future",
+        "url": "https://www.recordedfuture.com/feed",
+        "type": "news",
+        "italian_only": False,
+    },
+    {
+        "name": "Threat Post",
+        "url": "https://threatpost.com/feed/",
+        "type": "news",
+        "italian_only": False,
     },
 ]
 
@@ -393,73 +476,112 @@ def _strip_html(text: str) -> str:
 #  DATA FETCHING
 # ─────────────────────────────────────────────
 
-@st.cache_data(ttl=28, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_all_attacks() -> list[dict]:
-    """Fetch & parse RSS feeds, extract Italian geo info."""
+    """
+    Fetch & parse RSS feeds ogni 60 secondi.
+    - Feed italiani: accettati tutti
+    - Feed internazionali: filtrati per keyword italiane
+    """
     attacks = []
     tz_it = ZoneInfo("Europe/Rome")
 
+    # Capoluoghi regionali per fallback distribuzione geografica
+    FALLBACK_CITIES = [
+        (41.9028, 12.4964, "Roma", "Lazio"),
+        (45.4654, 9.1859, "Milano", "Lombardia"),
+        (40.8518, 14.2681, "Napoli", "Campania"),
+        (45.0703, 7.6869, "Torino", "Piemonte"),
+        (44.4949, 11.3426, "Bologna", "Emilia-Romagna"),
+        (43.7696, 11.2558, "Firenze", "Toscana"),
+        (45.4408, 12.3155, "Venezia", "Veneto"),
+        (38.1157, 13.3615, "Palermo", "Sicilia"),
+        (41.1171, 16.8719, "Bari", "Puglia"),
+        (44.4056, 8.9463, "Genova", "Liguria"),
+        (43.1107, 12.3908, "Perugia", "Umbria"),
+        (43.6158, 13.5189, "Ancona", "Marche"),
+        (39.2238, 9.1217, "Cagliari", "Sardegna"),
+        (46.0748, 11.1217, "Trento", "Trentino-Alto Adige"),
+        (42.3498, 13.3995, "L'Aquila", "Abruzzo"),
+    ]
+
+    ITALY_KEYWORDS = [
+        "ital", "roma", "milan", "napol", "torin", "firenz", "bologna",
+        "venezia", "sicilia", "sardegna", "puglia", "lazio", "lombardia",
+        "toscana", "veneto", "campania", "calabria", "piemonte", "liguria",
+        "umbria", "marche", "abruzzo", "basilicata", "molise",
+        ".it ", ".it/", "governo", "agenzia", "comune", "regione",
+        "inail", "inps", "polizia", "carabinieri", "finanza", "consip",
+        "trenitalia", "eni ", "enel ", "leonardo", "fincantieri",
+        "tim ", "windtre", "fastweb", "vodafone it",
+    ]
+
     for source in FEED_SOURCES:
         try:
-            feed = feedparser.parse(source["url"])
-            for entry in feed.entries[:30]:
-                title = entry.get("title", "")
+            # feedparser con timeout via requests
+            resp = requests.get(
+                source["url"],
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0 CyberMap/1.0"},
+            )
+            feed = feedparser.parse(resp.text if resp.ok else source["url"])
+
+            for entry in feed.entries[:40]:
+                title   = entry.get("title", "").strip()
                 summary = _strip_html(entry.get("summary", entry.get("description", "")))
-                link = entry.get("link", "#")
-                combined = f"{title} {summary}"
-
-                # Only keep Italy-related OR generic (ransomware type)
-                is_italian = any(kw in combined.lower() for kw in [
-                    "ital", "roma", "milan", "napol", "torin", "firenz", "bologna",
-                    "venezia", "sicilia", "sardegna", "puglia", "lazio", "lombardia",
-                    ".it ", ".it/", "governo", "agenzia", "comune", "regione",
-                    "inail", "inps", "polizia", "carabinieri", "finanza"
-                ]) or source["type"] in ("ransomware", "cert")
-
-                if not is_italian:
+                link    = entry.get("link", "#")
+                if not title:
                     continue
 
+                combined = f"{title} {summary}".lower()
+
+                # Filtro: se è feed internazionale, accetta solo se parla d'Italia
+                if not source.get("italian_only", False):
+                    if not any(kw in combined for kw in ITALY_KEYWORDS):
+                        if source["type"] not in ("ransomware", "cert"):
+                            continue
+
+                # Geo
                 geo = _extract_location(combined)
                 if geo is None:
-                    # Default to Rome (capital) with very small jitter — always on land
-                    lat, lon = _jitter(41.9028, 12.4964, 0.4)
-                    place = "Italia"
-                    region = "Nazionale"
+                    # Distribuisci uniformemente tra i capoluoghi, non tutto su Roma
+                    fb = FALLBACK_CITIES[hash(title) % len(FALLBACK_CITIES)]
+                    lat, lon = _jitter(fb[0], fb[1], 0.12)
+                    place  = fb[2]
+                    region = fb[3]
                 else:
                     lat, lon, place, region = geo
-                    lat, lon = _jitter(lat, lon, 0.08)
+                    lat, lon = _jitter(lat, lon, 0.06)
 
-                severity = _severity(combined)
+                severity  = _severity(combined)
                 published = _parse_date(entry)
+                uid       = _uid(title + link)
 
-                uid = _uid(title + link)
                 attacks.append({
-                    "id": uid,
-                    "title": title[:120],
-                    "summary": summary[:280],
-                    "link": link,
-                    "source": source["name"],
-                    "type": source["type"],
-                    "severity": severity,
-                    "lat": lat,
-                    "lon": lon,
-                    "place": place,
-                    "region": region,
+                    "id":        uid,
+                    "title":     title[:120],
+                    "summary":   summary[:300],
+                    "link":      link,
+                    "source":    source["name"],
+                    "type":      source["type"],
+                    "severity":  severity,
+                    "lat":       lat,
+                    "lon":       lon,
+                    "place":     place,
+                    "region":    region,
                     "published": published,
-                    "ts": published.strftime("%d/%m/%Y %H:%M"),
+                    "ts":        published.strftime("%d/%m/%Y %H:%M"),
                 })
         except Exception:
             continue
 
-    # Deduplicate by id
-    seen = set()
-    unique = []
+    # Deduplica per id
+    seen, unique = set(), []
     for a in attacks:
         if a["id"] not in seen:
             seen.add(a["id"])
             unique.append(a)
 
-    # Sort newest first
     unique.sort(key=lambda x: x["published"], reverse=True)
     return unique
 
@@ -563,9 +685,11 @@ def build_map(attacks: list[dict]) -> go.Figure:
         plot_bgcolor="#0a0c0f",
         margin=dict(l=0, r=0, t=0, b=0),
         mapbox=dict(
-            style="carto-darkmatter",   # crisp dark tiles, no token needed
-            center=dict(lat=42.0, lon=12.6),
-            zoom=5.1,
+            style="carto-darkmatter",
+            center=dict(lat=42.2, lon=12.8),
+            zoom=4.9,
+            # Blocca la vista sull'Italia
+            bounds=dict(west=5.5, east=20.0, south=35.0, north=48.5),
         ),
         legend=dict(
             orientation="h",
@@ -585,7 +709,7 @@ def build_map(attacks: list[dict]) -> go.Figure:
             align="left",
         ),
         dragmode="pan",
-        uirevision="italy_map",   # keeps zoom/pan on rerender
+        uirevision="italy_map",
     )
 
     # Hide glow traces from legend (they start with _)
@@ -759,7 +883,7 @@ def main():
 
     # Auto-refresh counter
     now = datetime.now(ZoneInfo("Europe/Rome"))
-    refresh_key = int(time.time() // 30)  # changes every 30s
+    refresh_key = int(time.time() // 60)  # cambia ogni 60s
 
     # Fetch data (cached 28s)
     with st.spinner(""):
@@ -798,7 +922,7 @@ def main():
         <span class="pulse-dot"></span>
         LIVE · {now.strftime('%d/%m/%Y %H:%M:%S')} IT ·
         {len(filtered)} events shown (filtered) · {total} total in history ·
-        next refresh in ~{30 - (int(time.time()) % 30)}s
+        next refresh in ~{60 - (int(time.time()) % 60)}s
     </div>
     """, unsafe_allow_html=True)
 
@@ -838,15 +962,16 @@ def main():
         with feed_container:
             render_feed(filtered)
 
-    # Auto-refresh with st.rerun via time-based trigger
-    time.sleep(0.5)
-    st.markdown("""
-    <script>
-    setTimeout(function() {
-        window.location.reload();
-    }, 30000);
-    </script>
-    """, unsafe_allow_html=True)
+    # ── AUTO-REFRESH REALE ───────────────────────────────────────────────────
+    # streamlit-autorefresh triggera un rerun ogni 60s → la cache scade → nuovi feed
+    if HAS_AUTOREFRESH:
+        st_autorefresh(interval=60_000, limit=None, key="live_refresh")
+    else:
+        # Fallback: JS reload se il pacchetto non è installato
+        st.markdown("""
+        <script>setTimeout(function(){window.location.reload();}, 60000);</script>
+        """, unsafe_allow_html=True)
+        st.caption("💡 Per il refresh reale installa: `pip install streamlit-autorefresh`")
 
 
 if __name__ == "__main__":
