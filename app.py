@@ -1,145 +1,129 @@
-You are a senior Python developer.
+import streamlit as st
+import requests
+import pandas as pd
+import random
+import folium
+from streamlit_folium import st_folium
+from datetime import datetime
 
-Create a ransomware threat intelligence dashboard written in Python using Streamlit.
+# CONFIG
+API_KEY = "4e0e9836-5b4d-4017-b21f-6b70e46fc812"
+API_URL = "https://api.ransomware.live/8k"
 
-The entire application must be contained in ONE SINGLE FILE called:
+ITALY_BOUNDS = {
+    "lat_min": 36.5,
+    "lat_max": 47.1,
+    "lon_min": 6.6,
+    "lon_max": 18.5
+}
 
-app.py
-
-The app must fetch ransomware incident data from the ransomware.live API.
-
-API configuration
-
-Use this endpoint:
-
-https://api.ransomware.live/8k
-
-Authentication header:
-
-X-API-KEY
-
-Example request:
-
-requests.get(
-"https://api.ransomware.live/8k",
-headers={"X-API-KEY": "YOUR_API_KEY"}
+# STREAMLIT PAGE
+st.set_page_config(
+    page_title="Italy Ransomware Threat Map",
+    layout="wide"
 )
 
-Application requirements
+st.title("🇮🇹 Italy Ransomware Threat Map")
 
-1. Framework
+# FETCH DATA
+@st.cache_data(ttl=60)
+def fetch_data():
 
-Use Streamlit.
+    try:
+        response = requests.get(
+            API_URL,
+            headers={"X-API-KEY": API_KEY},
+            timeout=10
+        )
 
-The app must run with:
+        if response.status_code != 200:
+            st.error("API connection failed")
+            return []
 
-streamlit run app.py
+        data = response.json()
+        return data
 
-2. Map
+    except Exception as e:
+        st.error(f"API error: {e}")
+        return []
 
-Display an interactive map of Italy.
 
-Use:
+data = fetch_data()
 
-streamlit-folium
-folium
+# CONVERT TO DATAFRAME
+df = pd.DataFrame(data)
 
-Center the map on:
+# RANDOM ITALY COORDINATES
+def random_italy_coords():
+    lat = random.uniform(ITALY_BOUNDS["lat_min"], ITALY_BOUNDS["lat_max"])
+    lon = random.uniform(ITALY_BOUNDS["lon_min"], ITALY_BOUNDS["lon_max"])
+    return lat, lon
 
-Latitude: 43
-Longitude: 12
 
-Zoom level: 6
+# SIDEBAR
+st.sidebar.title("Threat Intelligence")
 
-Limit the visible area to Italy.
+total_incidents = len(df)
 
-3. Incident markers
+groups = df["group"].nunique() if "group" in df else 0
 
-For each ransomware incident returned by the API:
+st.sidebar.metric("Total Incidents", total_incidents)
+st.sidebar.metric("Active Groups", groups)
+st.sidebar.write("Last update:", datetime.now().strftime("%H:%M:%S"))
 
-Create a red marker.
+st.sidebar.divider()
 
-Because the API does not contain coordinates, generate random coordinates inside Italy.
+st.sidebar.subheader("Incident History")
 
-Italy bounding box:
+if not df.empty:
+    for _, row in df.head(20).iterrows():
 
-Latitude: 36.5 → 47.1
-Longitude: 6.6 → 18.5
+        victim = row.get("victim", "Unknown")
+        group = row.get("group", "Unknown")
+        date = row.get("date", "Unknown")
 
-Each marker popup must show:
+        st.sidebar.write(f"**{victim}**")
+        st.sidebar.caption(f"{group} | {date}")
+        st.sidebar.divider()
 
-Victim name
-Ransomware group
-Country
-Date
+# MAP
+m = folium.Map(
+    location=[43, 12],
+    zoom_start=6,
+    tiles="CartoDB dark_matter"
+)
 
-4. Sidebar
+# MARKERS
+if not df.empty:
 
-Create a sidebar dashboard with:
+    for _, row in df.iterrows():
 
-Title:
-Italy Ransomware Threat Map
+        lat, lon = random_italy_coords()
 
-Display:
+        victim = row.get("victim", "Unknown")
+        group = row.get("group", "Unknown")
+        country = row.get("country", "Unknown")
+        date = row.get("date", "Unknown")
 
-Total incidents
-Active groups
-Last update timestamp
+        popup = f"""
+        <b>Victim:</b> {victim}<br>
+        <b>Group:</b> {group}<br>
+        <b>Country:</b> {country}<br>
+        <b>Date:</b> {date}
+        """
 
-Add an incident history list showing:
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=6,
+            color="red",
+            fill=True,
+            fill_color="red",
+            fill_opacity=0.8,
+            popup=popup
+        ).add_to(m)
 
-Victim name
-Group
-Date
+# SHOW MAP
+st_folium(m, width=1400, height=700)
 
-Newest incidents first.
-
-5. Data fetching
-
-Use the Python requests library.
-
-Refresh data every 60 seconds using Streamlit auto refresh.
-
-Avoid duplicates by generating a unique ID for each incident.
-
-Example:
-
-victim + group + date
-
-6. Styling
-
-Use Streamlit dark theme.
-
-Use clear dashboard layout.
-
-Map must occupy most of the screen.
-
-7. Error handling
-
-If the API fails:
-
-Show a Streamlit error message.
-
-Example:
-
-st.error("API connection failed")
-
-8. Dependencies
-
-Use only these libraries:
-
-streamlit
-requests
-folium
-streamlit-folium
-pandas
-
-9. Output
-
-Return ONLY the final Python code.
-
-Do not include explanations.
-
-The file must run immediately with:
-
-streamlit run app.py
+# AUTO REFRESH
+st.caption("Data refresh every 60 seconds")
