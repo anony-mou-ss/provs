@@ -364,7 +364,13 @@ def _extract_location(text: str):
 
 
 def _jitter(lat: float, lon: float, amount: float = 0.05) -> tuple:
-    return lat + random.uniform(-amount, amount), lon + random.uniform(-amount, amount)
+    """Small jitter to avoid perfect overlap, clamped to Italy's land bounding box."""
+    # Italy approximate land bounds: lat 36.6–47.1, lon 6.6–18.5
+    new_lat = lat + random.uniform(-amount, amount)
+    new_lon = lon + random.uniform(-amount, amount)
+    new_lat = max(36.6, min(47.1, new_lat))
+    new_lon = max(6.6, min(18.5, new_lon))
+    return new_lat, new_lon
 
 
 def _parse_date(entry) -> datetime:
@@ -415,8 +421,8 @@ def fetch_all_attacks() -> list[dict]:
 
                 geo = _extract_location(combined)
                 if geo is None:
-                    # Default to centre of Italy with jitter
-                    lat, lon = _jitter(42.5, 12.5, 2.0)
+                    # Default to Rome (capital) with very small jitter — always on land
+                    lat, lon = _jitter(41.9028, 12.4964, 0.4)
                     place = "Italia"
                     region = "Nazionale"
                 else:
@@ -467,10 +473,20 @@ SEVERITY_COLOR = {
     "medium":   "#ff9f0a",
     "low":      "#30d158",
 }
+SEVERITY_GLOW = {
+    "critical": "rgba(255,59,48,0.18)",
+    "medium":   "rgba(255,159,10,0.18)",
+    "low":      "rgba(48,209,88,0.18)",
+}
 SEVERITY_SIZE = {
-    "critical": 16,
-    "medium":   12,
-    "low":      9,
+    "critical": 14,
+    "medium":   10,
+    "low":      8,
+}
+SEVERITY_GLOW_SIZE = {
+    "critical": 32,
+    "medium":   24,
+    "low":      18,
 }
 
 
@@ -482,31 +498,52 @@ def build_map(attacks: list[dict]) -> go.Figure:
 
     fig = go.Figure()
 
-    # Italy outline via choropleth background
-    fig.add_trace(go.Scattergeo(
-        lon=[None], lat=[None],
-        mode="markers",
-        marker=dict(size=0),
-        showlegend=False,
-        hoverinfo="skip",
-    ))
-
-    # Plot attacks grouped by severity for legend
     for sev in ["critical", "medium", "low"]:
         sub = df[df["severity"] == sev] if len(df) > 0 else pd.DataFrame()
         if sub.empty:
             continue
 
         hover = [
-            f"<b>{row['title'][:60]}{'…' if len(row['title'])>60 else ''}</b><br>"
-            f"📍 {row['place']} — {row['region']}<br>"
-            f"🕒 {row['ts']}<br>"
-            f"🔗 {row['source']}<br>"
-            f"<span style='color:{SEVERITY_COLOR[sev]}'>[{sev.upper()}]</span>"
+            f"<b style='font-size:13px'>{row['title'][:65]}{'…' if len(row['title'])>65 else ''}</b><br>"
+            f"<span style='color:#7eb3d4'>📍 {row['place']} — {row['region']}</span><br>"
+            f"<span style='color:#586374'>🕒 {row['ts']} &nbsp;·&nbsp; {row['source']}</span><br>"
+            f"<span style='color:{SEVERITY_COLOR[sev]}; font-weight:600; font-size:10px; "
+            f"letter-spacing:0.08em'>▲ {sev.upper()}</span>"
             for _, row in sub.iterrows()
         ]
 
-        fig.add_trace(go.Scattergeo(
+        # Outer glow ring (large, transparent)
+        fig.add_trace(go.Scattermapbox(
+            lon=sub["lon"].tolist(),
+            lat=sub["lat"].tolist(),
+            mode="markers",
+            name=f"_{sev}_glow",
+            marker=dict(
+                size=SEVERITY_GLOW_SIZE[sev],
+                color=SEVERITY_GLOW[sev],
+                opacity=0.55,
+            ),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+        # Mid ring
+        fig.add_trace(go.Scattermapbox(
+            lon=sub["lon"].tolist(),
+            lat=sub["lat"].tolist(),
+            mode="markers",
+            name=f"_{sev}_mid",
+            marker=dict(
+                size=SEVERITY_GLOW_SIZE[sev] * 0.58,
+                color=SEVERITY_GLOW[sev],
+                opacity=0.45,
+            ),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+        # Core dot (solid, crisp)
+        fig.add_trace(go.Scattermapbox(
             lon=sub["lon"].tolist(),
             lat=sub["lat"].tolist(),
             mode="markers",
@@ -514,9 +551,7 @@ def build_map(attacks: list[dict]) -> go.Figure:
             marker=dict(
                 size=SEVERITY_SIZE[sev],
                 color=SEVERITY_COLOR[sev],
-                opacity=0.88,
-                symbol="circle",
-                line=dict(width=1, color="rgba(255,255,255,0.15)"),
+                opacity=0.95,
             ),
             text=hover,
             hovertemplate="%{text}<extra></extra>",
@@ -527,38 +562,36 @@ def build_map(attacks: list[dict]) -> go.Figure:
         paper_bgcolor="#0a0c0f",
         plot_bgcolor="#0a0c0f",
         margin=dict(l=0, r=0, t=0, b=0),
+        mapbox=dict(
+            style="carto-darkmatter",   # crisp dark tiles, no token needed
+            center=dict(lat=42.0, lon=12.6),
+            zoom=5.1,
+        ),
         legend=dict(
             orientation="h",
-            yanchor="bottom", y=0.01,
+            yanchor="bottom", y=0.02,
             xanchor="left", x=0.01,
-            bgcolor="rgba(15,19,24,0.85)",
+            bgcolor="rgba(10,12,15,0.82)",
             bordercolor="#1e2730",
             borderwidth=1,
             font=dict(family="IBM Plex Mono", size=10, color="#c8d0dc"),
-        ),
-        geo=dict(
-            scope="europe",
-            resolution=50,
-            center=dict(lat=42.5, lon=12.5),
-            projection_scale=5.2,
-            showland=True, landcolor="#141920",
-            showocean=True, oceancolor="#0a0c0f",
-            showlakes=True, lakecolor="#0f151c",
-            showrivers=False,
-            showcountries=True, countrycolor="#1e2730",
-            showcoastlines=True, coastlinecolor="#2a3540",
-            showframe=False,
-            bgcolor="#0a0c0f",
-            subunitcolor="#1e2730",
-            showsubunits=True,
+            itemsizing="constant",
+            traceorder="normal",
         ),
         hoverlabel=dict(
-            bgcolor="#141920",
-            bordercolor="#1e2730",
+            bgcolor="#0f1318",
+            bordercolor="#2a3540",
             font=dict(family="IBM Plex Sans", size=12, color="#c8d0dc"),
+            align="left",
         ),
         dragmode="pan",
+        uirevision="italy_map",   # keeps zoom/pan on rerender
     )
+
+    # Hide glow traces from legend (they start with _)
+    for trace in fig.data:
+        if trace.name and trace.name.startswith("_"):
+            trace.showlegend = False
 
     return fig
 
@@ -774,14 +807,16 @@ def main():
 
     with map_col:
         fig = build_map(filtered)
+        fig.update_layout(height=640)
         st.plotly_chart(
             fig,
             use_container_width=True,
             config={
                 "scrollZoom": True,
                 "displayModeBar": True,
-                "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
+                "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d", "resetScale2d"],
                 "displaylogo": False,
+                "toImageButtonOptions": {"format": "png", "filename": "italy_cybermap"},
             },
             key=f"map_{refresh_key}",
         )
@@ -799,7 +834,7 @@ def main():
             ◈ INCIDENT FEED — STORICO COMPLETO
         </div>""", unsafe_allow_html=True)
 
-        feed_container = st.container(height=620)
+        feed_container = st.container(height=640)
         with feed_container:
             render_feed(filtered)
 
