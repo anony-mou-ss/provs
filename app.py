@@ -1,43 +1,25 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║  ITALY CYBER THREAT MAP  v5.0                                        ║
-║                                                                      ║
-║  FONTI: solo incidenti reali confermati                              ║
-║  ┌────────────────────────────────────────────────────────────────┐  ║
-║  │ 1. ransomware.live  — vittime italiane, aggiornamento continuo  │  ║
-║  │ 2. hackmanac.github.io — database attacchi pubblici Italia      │  ║
-║  │ 3. CERT-AgID        — avvisi ufficiali italiani                 │  ║
-║  │ 4. CSIRT Italia     — incidenti gestiti                         │  ║
-║  │ 5. Red Hot Cyber    — cronaca attacchi in italiano              │  ║
-║  │ 6. Cybersecurity360 — incidenti settore Italia                  │  ║
-║  │ 7. BleepingComputer — filtra ".it" + nomi enti IT               │  ║
-║  │ 8. DataBreaches.net — database violazioni dati                  │  ║
-║  │ 9. HaveIBeenPwned   — breach pubblici .it                       │  ║
-║  │10. DarkFeed Telegram — feed pubblico APT/ransomware             │  ║
-║  └────────────────────────────────────────────────────────────────┘  ║
-║                                                                      ║
-║  ARCHITETTURA UI:                                                    ║
-║  · Thread fetcha ogni 20s                                            ║
-║  · st_autorefresh ogni 4s — SOLO se ci sono item nuovi              ║
-║  · Mappa: Plotly chart con key statica — aggiunge solo marker nuovi  ║
-║  · Feed: container HTML custom — append in cima senza re-render      ║
-║                                                                      ║
-║  pip install streamlit plotly requests feedparser pandas             ║
-║               streamlit-autorefresh                                  ║
-║  streamlit run italy_cybermap.py                                     ║
-╚══════════════════════════════════════════════════════════════════════╝
+ITALY CYBER THREAT MAP  v6.0
+Architettura semplice e affidabile:
+  - st.cache_data(ttl=30) per fetch con cache nativa Streamlit
+  - st_autorefresh ogni 30s triggera rerun → cache scaduta → nuovo fetch
+  - Nessun thread, nessun file IPC, nessun loop infinito
+  - Funziona su Streamlit Cloud, localmente, ovunque
+
+pip install streamlit plotly requests feedparser pandas streamlit-autorefresh
+streamlit run italy_cybermap.py
 """
 
-import json, os, re, hashlib, random, threading, time
+import re, hashlib, random, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import streamlit as st
 import plotly.graph_objects as go
 import requests, feedparser
 import pandas as pd
 
+# ── autorefresh opzionale ─────────────────────────────────────────────
 try:
     from streamlit_autorefresh import st_autorefresh
     HAS_AR = True
@@ -45,79 +27,67 @@ except ImportError:
     HAS_AR = False
 
 # ─────────────────────────────────────────────────────────────────────
-#  CONFIG
+#  PAGE CONFIG  — deve essere la prima chiamata st.*
 # ─────────────────────────────────────────────────────────────────────
-TZ         = ZoneInfo("Europe/Rome")
-FEED_FILE  = Path("/tmp/cybermap_v5.json")
-FETCH_INT  = 20      # secondi tra fetch
-POLL_MS    = 4000    # ms autorefresh UI
-MAX_ITEMS  = 1000
-
-_H = {"User-Agent": "Mozilla/5.0 ItalyCyberMap/5.0", "Accept": "*/*"}
-
-st.set_page_config(page_title="Italy Cyber Threat Map",
-                   page_icon="🛡️", layout="wide",
-                   initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Italy Cyber Threat Map",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ─────────────────────────────────────────────────────────────────────
 #  CSS
 # ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
-:root{--bg:#0a0c0f;--surf:#0f1318;--card:#141920;--brd:#1e2730;
-      --red:#ff3b30;--ora:#ff9f0a;--grn:#30d158;--txt:#c8d0dc;--dim:#586374;}
-html,body,[class*="css"]{background:var(--bg)!important;color:var(--txt)!important;
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap');
+:root{--bg:#0a0c0f;--card:#141920;--brd:#1e2730;
+      --red:#ff3b30;--ora:#ff9f0a;--grn:#30d158;--dim:#586374;}
+html,body,[class*="css"]{background:var(--bg)!important;color:#c8d0dc!important;
   font-family:'IBM Plex Sans',sans-serif!important;}
-[data-testid="stSidebar"]{background:var(--surf)!important;border-right:1px solid var(--brd)!important;}
-[data-testid="stSidebar"] *{color:var(--txt)!important;}
-h1,h2,h3,h4{font-family:'IBM Plex Mono',monospace!important;color:#e8ecf0!important;}
+[data-testid="stSidebar"]{background:#0f1318!important;border-right:1px solid var(--brd)!important;}
+[data-testid="stSidebar"] *{color:#c8d0dc!important;}
 [data-testid="metric-container"]{background:var(--card)!important;border:1px solid var(--brd)!important;
   border-radius:6px!important;padding:12px 16px!important;}
-[data-testid="metric-container"] label{color:var(--dim)!important;
-  font-family:'IBM Plex Mono',monospace!important;font-size:.65rem!important;
-  text-transform:uppercase;letter-spacing:.1em;}
-[data-testid="metric-container"] [data-testid="stMetricValue"]{
-  font-family:'IBM Plex Mono',monospace!important;font-size:1.6rem!important;color:var(--red)!important;}
-.stSelectbox>div>div,.stMultiSelect>div>div,.stTextInput>div>div,.stDateInput>div>div{
-  background:var(--card)!important;border:1px solid var(--brd)!important;color:var(--txt)!important;}
+[data-testid="metric-container"] label{color:var(--dim)!important;font-family:'IBM Plex Mono',monospace!important;
+  font-size:.65rem!important;text-transform:uppercase;letter-spacing:.1em;}
+[data-testid="metric-container"] [data-testid="stMetricValue"]{font-family:'IBM Plex Mono',monospace!important;
+  font-size:1.5rem!important;color:var(--red)!important;}
+.stMultiSelect>div>div,.stTextInput>div>div,.stDateInput>div>div{
+  background:var(--card)!important;border:1px solid var(--brd)!important;color:#c8d0dc!important;}
 .stButton>button{background:transparent!important;border:1px solid var(--red)!important;
   color:var(--red)!important;font-family:'IBM Plex Mono',monospace!important;
-  font-size:.75rem!important;letter-spacing:.08em;text-transform:uppercase;border-radius:3px!important;}
-.stButton>button:hover{background:var(--red)!important;color:#fff!important;}
+  font-size:.7rem!important;border-radius:3px!important;}
 hr{border-color:var(--brd)!important;}
-::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--bg)}
-::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
 
-.feed-wrap{display:flex;flex-direction:column;gap:0;}
 .fc{background:var(--card);border:1px solid var(--brd);border-left:3px solid var(--red);
-  border-radius:4px;padding:10px 14px;margin-bottom:7px;transition:opacity .3s;}
+  border-radius:4px;padding:10px 14px;margin-bottom:7px;}
 .fc.med{border-left-color:var(--ora)}.fc.low{border-left-color:var(--grn)}
-.fc.is-new{animation:slideIn .4s ease-out;}
-@keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
-.ft{font-weight:600;font-size:.83rem;color:#e8ecf0;margin-bottom:3px;line-height:1.35;}
-.ft a{color:#e8ecf0;text-decoration:none;}
-.ft a:hover{color:var(--red);}
-.fm{font-family:'IBM Plex Mono',monospace;font-size:.62rem;color:var(--dim);margin-bottom:4px;line-height:1.7;}
+.fc.nw{animation:sld .5s ease-out}
+@keyframes sld{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.ft{font-weight:600;font-size:.83rem;color:#e8ecf0;margin-bottom:3px;line-height:1.4;}
+.ft a{color:#e8ecf0;text-decoration:none}.ft a:hover{color:var(--red)}
+.fm{font-family:'IBM Plex Mono',monospace;font-size:.61rem;color:var(--dim);margin-bottom:4px;line-height:1.7;}
 .fd{font-size:.74rem;color:var(--dim);line-height:1.45;}
 .bx{display:inline-block;padding:1px 6px;border-radius:2px;font-family:'IBM Plex Mono',monospace;
-  font-size:.58rem;font-weight:600;letter-spacing:.05em;margin-right:3px;text-transform:uppercase;}
+  font-size:.57rem;font-weight:600;letter-spacing:.05em;margin-right:3px;text-transform:uppercase;}
 .bc{background:#3d1515;color:var(--red);border:1px solid var(--red);}
 .bm{background:#2d1f08;color:var(--ora);border:1px solid var(--ora);}
 .bl{background:#0d2418;color:var(--grn);border:1px solid var(--grn);}
 .br{background:#1a1f2a;color:#7eb3d4;border:1px solid #2a3a4d;}
 .bs{background:#1a1520;color:#c07aff;border:1px solid #3a2560;}
-.bn{background:#0d2010;color:var(--grn);border:1px solid var(--grn);animation:blink .6s step-end 5;}
-@keyframes blink{50%{opacity:0}}
+.bn{background:#0d2010;color:var(--grn);border:1px solid var(--grn);animation:blk .6s step-end 5;}
+@keyframes blk{50%{opacity:0}}
 .pulse{display:inline-block;width:7px;height:7px;background:var(--red);
-  border-radius:50%;margin-right:6px;animation:pulse 1.4s infinite;vertical-align:middle;}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,59,48,.7)}
-  70%{box-shadow:0 0 0 7px rgba(255,59,48,0)}100%{box-shadow:0 0 0 0 rgba(255,59,48,0)}}
-.sbar{font-family:'IBM Plex Mono',monospace;font-size:.62rem;color:var(--dim);
-  padding:4px 0;letter-spacing:.05em;}
+  border-radius:50%;margin-right:6px;animation:pls 1.4s infinite;vertical-align:middle;}
+@keyframes pls{0%{box-shadow:0 0 0 0 rgba(255,59,48,.7)}70%{box-shadow:0 0 0 7px rgba(255,59,48,0)}100%{box-shadow:0 0 0 0 rgba(255,59,48,0)}}
+.sbar{font-family:'IBM Plex Mono',monospace;font-size:.61rem;color:var(--dim);padding:4px 0;}
 #MainMenu,footer,header{visibility:hidden!important;}
 .block-container{padding-top:1.2rem!important;}
-</style>""", unsafe_allow_html=True)
+</style>
+""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────
 #  GEO DB
@@ -126,9 +96,9 @@ _CITIES = sorted([
     ("reggio calabria",38.1147,15.6615,"Calabria"),
     ("reggio emilia",44.6989,10.6297,"Emilia-Romagna"),
     ("ascoli piceno",42.854,13.5745,"Marche"),
+    ("vibo valentia",38.676,16.0995,"Calabria"),
     ("la spezia",44.1024,9.824,"Liguria"),
     ("l'aquila",42.3498,13.3995,"Abruzzo"),
-    ("vibo valentia",38.676,16.0995,"Calabria"),
     ("giugliano",40.9314,14.1958,"Campania"),
     ("bergamo",45.6983,9.6773,"Lombardia"),
     ("brescia",45.5416,10.2118,"Lombardia"),
@@ -174,6 +144,7 @@ _CITIES = sorted([
     ("roma",41.9028,12.4964,"Lazio"),
     ("rome",41.9028,12.4964,"Lazio"),
     ("latina",41.4677,12.9035,"Lazio"),
+    ("frosinone",41.6396,13.3396,"Lazio"),
     ("napoli",40.8518,14.2681,"Campania"),
     ("naples",40.8518,14.2681,"Campania"),
     ("salerno",40.6824,14.7681,"Campania"),
@@ -208,10 +179,7 @@ _CITIES = sorted([
     ("varese",45.8205,8.8257,"Lombardia"),
     ("mantova",45.1564,10.7914,"Lombardia"),
     ("cremona",45.1333,10.0227,"Lombardia"),
-    ("sapienza",41.9028,12.4964,"Lazio"),
-    ("policlinico",41.9028,12.4964,"Lazio"),
-    ("san raffaele",45.5,9.2648,"Lombardia"),
-    ("humanitas",45.4,9.35,"Lombardia"),
+    ("pavia",45.1847,9.1582,"Lombardia"),
     ("italia",41.9028,12.4964,"Nazionale"),
     ("italy",41.9028,12.4964,"Nazionale"),
     ("italian",41.9028,12.4964,"Nazionale"),
@@ -230,6 +198,7 @@ REGIONS = {
     "Molise":(41.5603,14.6564),"Valle d'Aosta":(45.7373,7.3154),
     "Nazionale":(41.9028,12.4964),
 }
+ALL_REGIONS = sorted(REGIONS)
 
 _FB = [
     (41.9028,12.4964,"Roma","Lazio"),(45.4654,9.1859,"Milano","Lombardia"),
@@ -244,597 +213,355 @@ _FB = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────
-#  FILTRI — solo incidenti REALI confermati
-#
-#  LOGICA: un item viene accettato SE:
-#  1. Parla di un'organizzazione/ente specifico che è stata attaccata
-#  2. Contiene un verbo di attacco concreto (hackerata, colpita, violata…)
-#  3. Riguarda l'Italia
-#
-#  NON viene accettato se:
-#  - È un avviso generico ("attenzione alla nuova vulnerabilità")
-#  - È una notizia su trend/statistiche
-#  - È un tutorial, commento, opinione
+#  FILTRI
 # ─────────────────────────────────────────────────────────────────────
-
-# Organizzazioni italiane note — match aumenta confidenza
-_ORGS_IT = re.compile(
-    r"\binail\b|\binps\b|\bpolizia\b|\bcarabinieri\b|\bfinanza\b"
-    r"|\bconsip\b|\btrenitalia\b|\benel\b|\beni\b|\bleonardo\b"
-    r"|\bfincantieri\b|\bfastweb\b|\btim\b|\bwind\b|\bvoda\b"
-    r"|\bintesa\b|\bunicredit\b|\bbnl\b|\bmediolanum\b|\bgenerale\b"
-    r"|\bposte\b|\bautostrade\b|\bsnam\b|\baces\b|\baces\b"
-    r"|\bospedale\b|\basl\b|\bpoliclinico\b|\bauniversit\b|\buniversit\w+"
-    r"|\bcomune\s+di\b|\bprovincia\s+di\b|\bregione\s+\w+"
-    r"|\bministero\b|\bprefettura\b|\bquestu\b|\btribunal\b"
-    r"|\bscuola\b|\bistituto\b|\bmunicip\w+|\bparlamento\b"
-    r"|\bsenato\b|\bcamera\b|\bpresidenza\b|\bpcm\b"
-    r"|\baci\b|\bata\b|\batm\b|\bamtab\b|\bgtm\b"
-    r"|\bferrovie\b|\bitalo\b|\balitalia\b|\bita\s+airway",
-    re.I,
-)
-
-# Verbi/frasi che indicano un incidente AVVENUTO (non ipotetico)
-_INCIDENT_RE = re.compile(
-    r"hackerata|hackerato|hacked\b|colpit[ao]\b|violat[ao]\b|attaccat[ao]\b"
+_INCIDENT = re.compile(
+    r"hackerata?|hacked\b|colpit[ao]\b|violat[ao]\b|attaccat[ao]\b"
     r"|compromess[ao]\b|infiltrat[ao]\b|rubat[ao]\b|trafugat[ao]\b"
-    r"|esfiltrat[ao]\b|cifrat[ao]\b|criptat[ao]\b|bloccata\b|fuori\s+servizio\b"
-    r"|data\s+breach\b|databreach\b|ransomware\s+attack\b|sotto\s+attacco\b"
-    r"|in\s+ginocchio\b|paralizzat[ao]\b|inaccessibil\w+|down\b"
-    r"|leaked?\b|dump(ed)?\b|exfiltrat\w+|breached\b|pwned\b"
-    r"|victim\b|vittime?\b|colpisce\b|prende\s+di\s+mira\b"
-    r"|rivendicat[ao]\b|claim(ed|s)?\b|pubblica(to)?\s+(i\s+)?dat"
-    r"|messo\s+online\b|pubblicati\s+i\s+dati\b|dati\s+rubati\b"
-    r"|offline\b|irraggiungibil\w+|sistema.{0,20}bloccato"
-    r"|attack(ed|s)?\b|intrusion\b|breach\b|incident\b|incidente\b",
+    r"|esfiltrat\w*|cifrat[ao]\b|criptat[ao]\b|bloccata?\b|paralizzat[ao]\b"
+    r"|data\s*breach|databreach|ransomware\s+attack|sotto\s+attacco"
+    r"|fuori\s+servizio|inaccessibil\w+|offline\b|down\b"
+    r"|leak(ed)?\b|dump(ed)?\b|breached?\b|pwned\b"
+    r"|victim\b|vittime?\b|rivendicat[ao]\b|claim(ed|s)?\b"
+    r"|dati\s+rubati|dati\s+pubblicati|sistema\b.{0,25}bloccat"
+    r"|attack(ed|s)?\b|intrusion\b|breach\b|incidente\b",
     re.I,
 )
-
-# Keyword Italia
-_IT_RE = re.compile(
+_ITALY = re.compile(
     r"\bital\w+|\broma\b|\bmilan\w*|\bnapol\w*|\btorin\w*|\bfirenz\w*"
     r"|\bbologna\b|\bvenezia\b|\bgenov\w*|\bpalermo\b|\bbari\b"
     r"|\bsicilia\b|\bsardegna\b|\bpuglia\b|\blazio\b|\blombardia\b"
     r"|\btoscana\b|\bveneto\b|\bcampania\b|\bcalabria\b|\bpiemonte\b"
     r"|\bliguria\b|\bumbria\b|\bmarche\b|\babruzzo\b|\bbasilicata\b"
-    r"|\.it[\s/\"\'<>]|[\"\']\w+\.it\b"
-    r"|\bgoverno\s+italiano\b|\bministero\b|\bprefettura\b",
+    r"|\.it[\s/\"\'<>]"
+    r"|\binail\b|\binps\b|\bpolizia\b|\bcarabinieri\b|\bconsip\b"
+    r"|\btrenitalia\b|\benel\b|\beni\b|\bleonardo\b|\bfincantieri\b"
+    r"|\bfastweb\b|\btim\b|\bintesa\b|\bunicredit\b|\bbnl\b"
+    r"|\bposte\s+italian\w*|\bautostrade\b|\bsnam\b"
+    r"|\bospedale\b|\basl\b|\buniversit\w+|\bcomune\s+di\b"
+    r"|\bministero\b|\bprefettura\b|\bparlamento\b|\bsenato\b",
     re.I,
 )
-
-# Blacklist assoluta — scarta sempre
-_NOISE_RE = re.compile(
-    r"\bcome\s+(protegger|difender|prevenire)\b|\bcome\s+fare\b"
-    r"|\bguida\b|\btutorial\b|\bhow\s+to\b|\btips?\b"
-    r"|\bstatistich\w+\b|\btendenz\w+\b|\bprevision\w+\b|\brapporto\s+annual\b"
-    r"|\bwebinar\b|\bcorso\b|\bformazione\b|\bevento\b|\bconferenz\w+\b"
-    r"|\bsconto\b|\bofferta\b|\brecensione\b|\breview\b|\bannuncio\b"
-    r"|\bopinione\b|\bcommentario\b|\banalisi\s+del\s+mercato\b"
+_NOISE = re.compile(
+    r"\bcome\s+(protegger|difender|prevenire)\b|\bguida\b|\btutorial\b|\bhow\s+to\b"
+    r"|\bstatistich\w+\b|\btendenz\w+\b|\brapporto\s+annual\w*\b"
+    r"|\bwebinar\b|\bcorso\b|\bformazione\b|\bconferenz\w+\b"
+    r"|\bsconto\b|\bofferta\b|\brecensione\b|\breview\b"
     r"|\bnew\s+feature\b|\bpatch\s+tuesday\b|\bwindows\s+update\b"
-    r"|\bjob\b|\bassunz\w+\b|\bcarrier\w+\b",
+    r"|\bjob\b|\bassunz\w+\b",
     re.I,
 )
 
-def _accept(title: str, summary: str, source_type: str) -> bool:
-    """Decide se un item è un incidente reale da mostrare."""
-    text = f"{title} {summary}"
-    if _NOISE_RE.search(text):
-        return False
-    # Fonti istituzionali italiane: accetta tutto (sono già incidenti)
-    if source_type == "CERT_IT":
-        return True
-    # Fonti ransomware: accetta solo vittime italiane (già filtrate prima)
-    if source_type == "RANSOMWARE":
-        return True
-    # Altre fonti: deve avere verbo di incidente + keyword Italia
-    has_incident = bool(_INCIDENT_RE.search(text))
-    has_italy    = bool(_IT_RE.search(text)) or bool(_ORGS_IT.search(text))
-    return has_incident and has_italy
+def _ok(title, summary, cert=False):
+    t = f"{title} {summary}"
+    if _NOISE.search(t): return False
+    if cert: return True
+    return bool(_INCIDENT.search(t)) and bool(_ITALY.search(t))
 
 # ─────────────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────────────
+_H = {"User-Agent": "Mozilla/5.0 ItalyCyberMap/6.0", "Accept": "*/*"}
+
 def _uid(s):
     return hashlib.md5(s.lower().strip().encode("utf-8","replace")).hexdigest()[:12]
 
-def _dedup_key(title):
-    # Rimuovi date, numeri, articoli per dedup fuzzy
-    t = re.sub(r"\b\d+\b","",title.lower())
-    t = re.sub(r"\b(il|la|lo|i|gli|le|un|una|di|da|in|con|su|per|e|è)\b","",t)
-    t = re.sub(r"\s+"," ",t).strip()
-    return _uid(t)
+def _strip(s):
+    return re.sub(r"<[^>]+>", "", s or "").strip()
 
-def _strip(s): return re.sub(r"<[^>]+>","",s or "").strip()
+def _jitter(lat, lon, a=0.04):
+    return (max(36.6, min(47.1, lat + random.uniform(-a, a))),
+            max(6.6,  min(18.5, lon + random.uniform(-a, a))))
 
-def _jitter(lat,lon,a=0.035):
-    return (max(36.6,min(47.1,lat+random.uniform(-a,a))),
-            max(6.6, min(18.5,lon+random.uniform(-a,a))))
-
-def _sev(text):
-    t = text.lower()
-    if re.search(r"ransomware|exfiltrat|data.?breach|zero.?day|critico|critical"
+def _sev(t):
+    t = t.lower()
+    if re.search(r"ransomware|data.?breach|exfiltrat|zero.?day|critico|critical"
                  r"|lockbit|blackcat|cl0p|alphv|rhysida|akira|medusa|conti|hive"
-                 r"|darkside|apt\d|nation.?state|paralizzat|bloccata|cifrat",t):
-        return "critical"
+                 r"|darkside|apt\d|paralizzat|cifrat|criptat", t): return "critical"
     if re.search(r"phishing|malware|ddos|exploit|hacked|compromess|breach|leak"
-                 r"|defacement|backdoor|botnet|stealer|intrusion|attacco|violat",t):
-        return "medium"
+                 r"|defacement|backdoor|botnet|stealer|intrusion|attacco|violat", t): return "medium"
     return "low"
 
 def _geo(text):
     t = text.lower()
-    for city,lat,lon,reg in _CITIES:
-        if re.search(r"\b"+re.escape(city)+r"\b",t):
-            return lat,lon,city.title(),reg
-    for reg,(lat,lon) in REGIONS.items():
-        if re.search(r"\b"+re.escape(reg.lower())+r"\b",t):
-            return lat,lon,reg,reg
+    for city, lat, lon, reg in _CITIES:
+        if re.search(r"\b" + re.escape(city) + r"\b", t):
+            return lat, lon, city.title(), reg
+    for reg, (lat, lon) in REGIONS.items():
+        if re.search(r"\b" + re.escape(reg.lower()) + r"\b", t):
+            return lat, lon, reg, reg
     return None
 
-def _now(): return datetime.now(TZ)
+def _now():
+    return datetime.now(ZoneInfo("Europe/Rome"))
 
-def _parse_dt(s):
-    for fmt in ("%Y-%m-%dT%H:%M:%S","%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%SZ","%Y-%m-%d"):
+def _pdt(s):
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
         try:
-            return datetime.strptime(s[:19],fmt).replace(
-                tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+            return datetime.strptime(s[:19], fmt).replace(
+                tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Rome"))
         except: pass
     return _now()
 
-def _rss_dt(e):
-    for a in ("published_parsed","updated_parsed","created_parsed"):
-        t = getattr(e,a,None)
+def _rdt(e):
+    for a in ("published_parsed", "updated_parsed"):
+        t = getattr(e, a, None)
         if t:
-            try: return datetime(*t[:6],tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+            try: return datetime(*t[:6], tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Rome"))
             except: pass
     return _now()
 
-def _item(title,summary,link,source,pub=None,geo_hint="",stype="NEWS"):
-    if pub is None: pub = _now()
-    text = f"{title} {summary} {geo_hint}"
+def _mk(title, summary, link, source, pub=None, hint=""):
+    if not pub: pub = _now()
+    text = f"{title} {summary} {hint}"
     g = _geo(text)
-    if g is None:
-        fb = _FB[hash(title) % len(_FB)]
-        lat,lon = _jitter(fb[0],fb[1],0.15)
-        place,region = fb[2],fb[3]
+    if g:
+        lat, lon, place, region = g
+        lat, lon = _jitter(lat, lon, 0.035)
     else:
-        lat,lon,place,region = g
-        lat,lon = _jitter(lat,lon,0.035)
+        fb = _FB[hash(title) % len(_FB)]
+        lat, lon = _jitter(fb[0], fb[1], 0.12)
+        place, region = fb[2], fb[3]
     return {
-        "id":        _uid(title+link),
-        "dk":        _dedup_key(title),
-        "title":     title[:160],
-        "summary":   summary[:420],
-        "link":      link,
-        "source":    source,
-        "stype":     stype,
-        "severity":  _sev(text),
-        "lat":       round(lat,5),
-        "lon":       round(lon,5),
-        "place":     place,
-        "region":    region,
-        "pub":       pub.isoformat(),
-        "ts":        pub.strftime("%d/%m/%Y %H:%M"),
-        "is_new":    True,
-        "upd":       0,
+        "id":      _uid(title + link),
+        "title":   title[:160],
+        "summary": summary[:400],
+        "link":    link,
+        "source":  source,
+        "sev":     _sev(text),
+        "lat":     round(lat, 5),
+        "lon":     round(lon, 5),
+        "place":   place,
+        "region":  region,
+        "pub":     pub,
+        "ts":      pub.strftime("%d/%m/%Y %H:%M"),
     }
 
-def _merge(old,new):
-    if len(new["summary"]) > len(old["summary"]):
-        old["summary"] = new["summary"]
-    if new["severity"]=="critical": old["severity"]="critical"
-    old["upd"] = old.get("upd",0)+1
-    return old
-
 # ─────────────────────────────────────────────────────────────────────
-#  IPC — file JSON atomico
+#  FETCH FUNCTIONS — cached 30s con st.cache_data
 # ─────────────────────────────────────────────────────────────────────
-_flock = threading.Lock()
 
-def _write(items):
-    tmp = FEED_FILE.with_suffix(".tmp")
-    with _flock:
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_ransomware_live():
+    items = []
+    for ep in [
+        "https://api.ransomware.live/recentvictims",
+        "https://api.ransomware.live/victims",
+    ]:
         try:
-            tmp.write_text(json.dumps(items,ensure_ascii=False),encoding="utf-8")
-            tmp.replace(FEED_FILE)
-        except: pass
-
-def _read():
-    try:
-        if FEED_FILE.exists():
-            raw = json.loads(FEED_FILE.read_text(encoding="utf-8"))
-            for r in raw:
-                if isinstance(r.get("pub"),str):
-                    try: r["pub_dt"] = datetime.fromisoformat(r["pub"])
-                    except: r["pub_dt"] = _now()
-            return raw
-    except: pass
-    return []
-
-# ─────────────────────────────────────────────────────────────────────
-#  FETCHERS — solo incidenti reali
-# ─────────────────────────────────────────────────────────────────────
-
-def _f_ransomware_live():
-    """API JSON pubblica ransomware.live — vittime italiane."""
-    out = []
-    for ep in ["https://api.ransomware.live/recentvictims",
-               "https://api.ransomware.live/victims"]:
-        try:
-            r = requests.get(ep,timeout=15,headers=_H)
+            r = requests.get(ep, timeout=15, headers=_H)
             if not r.ok: continue
             data = r.json()
-            if isinstance(data,dict):
-                data = data.get("data", data.get("victims", data.get("result",[])))
-            for v in (data or [])[:200]:
+            if isinstance(data, dict):
+                data = data.get("data", data.get("victims", data.get("result", [])))
+            for v in (data or [])[:300]:
                 country = (v.get("country","") or v.get("Country","") or "").strip().lower()
-                domain  = (v.get("domain","") or v.get("website","") or "").strip().lower()
-                victim  = (v.get("victim","") or v.get("name","") or v.get("company","") or "").strip()
+                domain  = (v.get("domain","")  or v.get("website","") or "").strip().lower()
+                victim  = (v.get("victim","")  or v.get("name","")    or v.get("company","") or "").strip()
                 desc    = _strip(v.get("description","") or v.get("summary","") or "")
-                group   = (v.get("group","") or v.get("ransomware_group","") or "unknown").strip()
-                link    = (v.get("url","") or v.get("link","")
+                group   = (v.get("group","")   or v.get("ransomware_group","") or "unknown").strip()
+                link    = (v.get("url","")     or v.get("link","")
                            or f"https://www.ransomware.live/#victim={_uid(victim)}")
                 is_it   = (country in ("italy","it","italia")
                            or domain.endswith(".it")
-                           or _IT_RE.search(f"{victim} {desc}"))
+                           or bool(_ITALY.search(f"{victim} {desc}")))
                 if not is_it: continue
-                raw_d   = (v.get("published","") or v.get("date","")
-                           or v.get("discovered","") or v.get("added","") or "")
-                pub     = _parse_dt(raw_d) if raw_d else _now()
-                title   = f"[{group.upper()}] Colpita: {victim}" if victim else f"Vittima ransomware {group}"
-                summary = desc or f"Organizzazione italiana colpita dal gruppo ransomware {group}. Dominio: {domain}"
-                out.append(_item(title,summary,link,"Ransomware.live",pub,
-                                 f"{victim} {domain} italia",stype="RANSOMWARE"))
+                raw_d = (v.get("published","") or v.get("date","")
+                         or v.get("discovered","") or v.get("added","") or "")
+                pub   = _pdt(raw_d) if raw_d else _now()
+                title = f"[{group.upper()}] Colpita: {victim}" if victim else f"Ransomware {group} — vittima italiana"
+                summ  = desc or f"Organizzazione italiana colpita dal gruppo ransomware {group}. Dominio: {domain}"
+                items.append(_mk(title, summ, link, "Ransomware.live", pub, f"{victim} {domain} italia"))
         except: continue
-    return out
+    return items
 
-def _f_hackmanac():
-    """hackmanac su GitHub — database attacchi pubblici con focus Italia."""
-    out = []
-    # File JSON pubblico del progetto hackmanac (nessuna auth)
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_cyberwatch():
+    """Cyberwatch-IT: database attacchi italiani documentati su GitHub."""
+    items = []
     urls = [
         "https://raw.githubusercontent.com/Casualtek/Cyberwatch-it/main/cyberattacks.json",
-        "https://raw.githubusercontent.com/Casualtek/Ransomwatch/main/profiles.json",
     ]
     for url in urls:
         try:
-            r = requests.get(url,timeout=15,headers=_H)
+            r = requests.get(url, timeout=15, headers=_H)
             if not r.ok: continue
             data = r.json()
-            if not isinstance(data,list): data = list(data.values()) if isinstance(data,dict) else []
-            for v in data[:300]:
-                if isinstance(v,str): continue
+            if not isinstance(data, list):
+                data = list(data.values()) if isinstance(data, dict) else []
+            for v in data[:500]:
+                if not isinstance(v, dict): continue
                 title   = (v.get("title","") or v.get("name","") or v.get("victim","") or "").strip()
                 summary = _strip(v.get("description","") or v.get("summary","") or v.get("text","") or "")
                 link    = (v.get("url","") or v.get("link","") or v.get("source","") or "#")
-                country = (v.get("country","") or "").lower()
-                if country and country not in ("it","ita","italy","italian","italia"):
-                    if not _IT_RE.search(f"{title} {summary}"):
-                        continue
-                raw_d = (v.get("date","") or v.get("published","") or v.get("added","") or "")
-                pub   = _parse_dt(raw_d) if raw_d else _now()
+                raw_d   = (v.get("date","") or v.get("published","") or v.get("added","") or "")
+                pub     = _pdt(raw_d) if raw_d else _now()
                 if not title: continue
-                out.append(_item(title,summary,link,"Hackmanac/Cyberwatch",pub,
-                                 f"{title} italia",stype="RANSOMWARE"))
+                items.append(_mk(title, summary, link, "Cyberwatch-IT", pub, "italia"))
         except: continue
-    return out
+    return items
 
-def _f_cert_agid():
-    out = []
-    for url,name in [
-        ("https://cert-agid.gov.it/feed/","CERT-AgID"),
-        ("https://www.csirt.gov.it/feed","CSIRT Italia"),
-    ]:
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_rss_sources():
+    """Tutti gli RSS — un'unica funzione cachata."""
+    sources = [
+        # Istituzionali IT (cert=True: accetta tutto)
+        ("https://cert-agid.gov.it/feed/",            "CERT-AgID",          True),
+        ("https://www.csirt.gov.it/feed",              "CSIRT Italia",       True),
+        # Media italiani (filtro incidente+italy)
+        ("https://www.redhotcyber.com/feed/",          "Red Hot Cyber",      False),
+        ("https://www.cybersecurity360.it/feed/",      "Cybersecurity360",   False),
+        # Internazionali (filtro incidente+italy)
+        ("https://www.bleepingcomputer.com/feed/",     "BleepingComputer",   False),
+        ("https://feeds.feedburner.com/TheHackersNews","The Hacker News",    False),
+        ("https://www.darkreading.com/rss.xml",        "DarkReading",        False),
+        ("https://krebsonsecurity.com/feed/",          "Krebs on Security",  False),
+        ("https://www.databreaches.net/feed/",         "DataBreaches.net",   False),
+        ("https://therecord.media/feed/",              "The Record",         False),
+        ("https://www.infosecurity-magazine.com/rss/news/","Infosecurity",   False),
+        ("https://www.securityweek.com/feed/",         "SecurityWeek",       False),
+        ("https://www.helpnetsecurity.com/feed/",      "HelpNet Security",   False),
+        ("https://threatpost.com/feed/",               "Threatpost",         False),
+    ]
+    items = []
+    seen  = set()
+    for url, name, cert in sources:
         try:
-            r = requests.get(url,timeout=12,headers=_H)
+            r    = requests.get(url, timeout=10, headers=_H)
             feed = feedparser.parse(r.text if r.ok else "")
-            for e in feed.entries[:50]:
+            for e in feed.entries[:80]:
                 title   = _strip(e.get("title","")).strip()
-                summary = _strip(e.get("summary",e.get("description","")))
+                summary = _strip(e.get("summary", e.get("description","")))
                 link    = e.get("link","#")
-                if not title: continue
-                if _NOISE_RE.search(f"{title} {summary}"): continue
-                out.append(_item(title,summary,link,name,_rss_dt(e),stype="CERT_IT"))
+                if not title or title in seen: continue
+                if not _ok(title, summary, cert=cert): continue
+                seen.add(title)
+                items.append(_mk(title, summary, link, name, _rdt(e)))
         except: continue
-    return out
+    return items
 
-def _f_rhc():
-    """Red Hot Cyber — notizie incidenti in italiano."""
-    out = []
-    try:
-        r = requests.get("https://www.redhotcyber.com/feed/",timeout=12,headers=_H)
-        feed = feedparser.parse(r.text if r.ok else "")
-        for e in feed.entries[:60]:
-            title   = _strip(e.get("title","")).strip()
-            summary = _strip(e.get("summary",e.get("description","")))
-            link    = e.get("link","#")
-            if not title: continue
-            if not _accept(title,summary,"NEWS"): continue
-            out.append(_item(title,summary,link,"Red Hot Cyber",_rss_dt(e),stype="NEWS"))
-    except: pass
-    return out
 
-def _f_cs360():
-    out = []
-    try:
-        r = requests.get("https://www.cybersecurity360.it/feed/",timeout=12,headers=_H)
-        feed = feedparser.parse(r.text if r.ok else "")
-        for e in feed.entries[:60]:
-            title   = _strip(e.get("title","")).strip()
-            summary = _strip(e.get("summary",e.get("description","")))
-            link    = e.get("link","#")
-            if not title: continue
-            if not _accept(title,summary,"NEWS"): continue
-            out.append(_item(title,summary,link,"Cybersecurity360",_rss_dt(e),stype="NEWS"))
-    except: pass
-    return out
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_abuse_ch():
+    """URLhaus + ThreatFox + Feodo — abuse.ch — infrastruttura italiana."""
+    items = []
 
-def _f_bleeping():
-    out = []
-    try:
-        r = requests.get("https://www.bleepingcomputer.com/feed/",timeout=12,headers=_H)
-        feed = feedparser.parse(r.text if r.ok else "")
-        for e in feed.entries[:80]:
-            title   = _strip(e.get("title","")).strip()
-            summary = _strip(e.get("summary",e.get("description","")))
-            link    = e.get("link","#")
-            if not title: continue
-            if not _accept(title,summary,"NEWS"): continue
-            out.append(_item(title,summary,link,"BleepingComputer",_rss_dt(e),stype="NEWS"))
-    except: pass
-    return out
-
-def _f_databreaches():
-    """DataBreaches.net — database violazioni pubbliche."""
-    out = []
-    try:
-        r = requests.get("https://www.databreaches.net/feed/",timeout=12,headers=_H)
-        feed = feedparser.parse(r.text if r.ok else "")
-        for e in feed.entries[:60]:
-            title   = _strip(e.get("title","")).strip()
-            summary = _strip(e.get("summary",e.get("description","")))
-            link    = e.get("link","#")
-            if not title: continue
-            if not _accept(title,summary,"NEWS"): continue
-            out.append(_item(title,summary,link,"DataBreaches.net",_rss_dt(e),stype="NEWS"))
-    except: pass
-    return out
-
-def _f_threatpost():
-    out = []
-    for url,name in [
-        ("https://threatpost.com/feed/","Threatpost"),
-        ("https://feeds.feedburner.com/TheHackersNews","The Hacker News"),
-        ("https://www.darkreading.com/rss.xml","DarkReading"),
-        ("https://krebsonsecurity.com/feed/","Krebs on Security"),
-        ("https://www.helpnetsecurity.com/feed/","Help Net Security"),
-        ("https://therecord.media/feed/","The Record"),
-        ("https://www.infosecurity-magazine.com/rss/news/","Infosecurity Magazine"),
-        ("https://www.securityweek.com/feed/","SecurityWeek"),
-    ]:
-        try:
-            r = requests.get(url,timeout=12,headers=_H)
-            feed = feedparser.parse(r.text if r.ok else "")
-            for e in feed.entries[:60]:
-                title   = _strip(e.get("title","")).strip()
-                summary = _strip(e.get("summary",e.get("description","")))
-                link    = e.get("link","#")
-                if not title: continue
-                if not _accept(title,summary,"NEWS"): continue
-                out.append(_item(title,summary,link,name,_rss_dt(e),stype="NEWS"))
-        except: continue
-    return out
-
-def _f_urlhaus():
-    """URLhaus — URL malware con host .it"""
-    out = []
+    # URLhaus — URL malware su host .it
     try:
         r = requests.post("https://urlhaus-api.abuse.ch/api/v1/",
-                          data={"query":"get_urls","limit":100},
-                          headers=_H,timeout=12)
-        if not r.ok: return []
-        for u in r.json().get("urls",[]):
-            host = (u.get("host","") or "").lower()
-            url_str = (u.get("url","") or "")
-            if not host.endswith(".it"): continue
-            threat = u.get("threat","") or "malware"
-            tags   = ", ".join(u.get("tags") or [])
-            title   = f"[URLhaus] {threat.upper()} su {host}"
-            summary = f"URL malevola su infrastruttura italiana: {url_str[:100]} | Tags: {tags} | Status: {u.get('url_status','')}"
-            link    = u.get("urlhaus_reference","https://urlhaus.abuse.ch")
-            pub     = _parse_dt(u.get("date_added",""))
-            out.append(_item(title,summary,link,"URLhaus",pub,f"italy .it {host}",stype="THREAT"))
+                          data={"query":"get_urls","limit":200}, headers=_H, timeout=12)
+        if r.ok:
+            for u in r.json().get("urls",[]):
+                host = (u.get("host","") or "").lower()
+                if not host.endswith(".it"): continue
+                url_str = u.get("url","") or ""
+                threat  = u.get("threat","") or "malware"
+                tags    = ", ".join(u.get("tags") or [])
+                title   = f"[URLhaus] {threat.upper()} su {host}"
+                summ    = f"URL malevola su infrastruttura italiana: {url_str[:100]} | Tags: {tags}"
+                link    = u.get("urlhaus_reference","https://urlhaus.abuse.ch")
+                pub     = _pdt(u.get("date_added",""))
+                items.append(_mk(title, summ, link, "URLhaus", pub, f"italy .it {host}"))
     except: pass
-    return out
 
-def _f_threatfox():
-    """ThreatFox IoC — malware italiani."""
-    out = []
+    # ThreatFox — IoC con paese Italia
     try:
         r = requests.post("https://threatfox-api.abuse.ch/api/v1/",
-                          json={"query":"get_iocs","days":1},
-                          headers=_H,timeout=12)
-        if not r.ok: return []
-        for ioc in r.json().get("data",[])[:100]:
-            country = (ioc.get("reporter_country","") or "").upper()
-            if country and country not in ("IT","ITA"): continue
-            malware = ioc.get("malware","") or "unknown"
-            ioc_val = ioc.get("ioc","") or ""
-            tags    = ", ".join(ioc.get("tags") or [])
-            title   = f"[ThreatFox] {malware} IoC italiano: {ioc_val[:40]}"
-            summary = (f"Indicatore di compromissione rilevato in Italia | "
-                       f"Malware: {malware} | Type: {ioc.get('ioc_type','')} | Tags: {tags}")
-            link    = f"https://threatfox.abuse.ch/ioc/{ioc.get('id','')}"
-            pub     = _parse_dt(ioc.get("first_seen",""))
-            out.append(_item(title,summary,link,"ThreatFox",pub,"italy",stype="THREAT"))
+                          json={"query":"get_iocs","days":1}, headers=_H, timeout=12)
+        if r.ok:
+            for ioc in r.json().get("data",[])[:100]:
+                country = (ioc.get("reporter_country","") or "").upper()
+                if country and country not in ("IT","ITA"): continue
+                malware = ioc.get("malware","") or "unknown"
+                ioc_val = ioc.get("ioc","") or ""
+                tags    = ", ".join(ioc.get("tags") or [])
+                title   = f"[ThreatFox] {malware} — IoC italiano: {ioc_val[:40]}"
+                summ    = f"Indicatore di compromissione in Italia | Malware: {malware} | Tags: {tags}"
+                link    = f"https://threatfox.abuse.ch/ioc/{ioc.get('id','')}"
+                pub     = _pdt(ioc.get("first_seen",""))
+                items.append(_mk(title, summ, link, "ThreatFox", pub, "italy"))
     except: pass
-    return out
 
-def _f_feodo():
-    """Feodo Tracker — C2 server in Italia."""
-    out = []
+    # Feodo — C2 server in Italia
     try:
-        r = requests.get(
-            "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json",
-            timeout=12,headers=_H)
-        if not r.ok: return []
-        data = r.json()
-        if isinstance(data,dict): data = data.get("ip_addresses",[])
-        for e in (data or []):
-            if (e.get("country","") or "").upper() not in ("IT","ITA"): continue
-            ip     = e.get("ip_address","") or ""
-            mal    = e.get("malware","") or "unknown"
-            title   = f"[Feodo] Server C2 {mal} in Italia: {ip}"
-            summary = (f"Infrastruttura C2 di {mal} ospitata in Italia | "
-                       f"IP: {ip} | Porta: {e.get('port','')} | Status: {e.get('status','')}")
-            link    = "https://feodotracker.abuse.ch"
-            pub     = _parse_dt(e.get("first_seen","") or e.get("last_online",""))
-            out.append(_item(title,summary,link,"Feodo Tracker",pub,"italy italia",stype="THREAT"))
+        r = requests.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json",
+                         timeout=12, headers=_H)
+        if r.ok:
+            data = r.json()
+            if isinstance(data, dict): data = data.get("ip_addresses",[])
+            for e in (data or []):
+                if (e.get("country","") or "").upper() not in ("IT","ITA"): continue
+                ip  = e.get("ip_address","") or ""
+                mal = e.get("malware","") or "unknown"
+                title = f"[Feodo] Server C2 {mal} in Italia: {ip}"
+                summ  = f"C2 ospitato in Italia | IP: {ip} | Malware: {mal} | Porta: {e.get('port','')}"
+                items.append(_mk(title, summ, "https://feodotracker.abuse.ch",
+                                 "Feodo Tracker", _pdt(e.get("first_seen","")), "italy italia"))
     except: pass
-    return out
 
-def _f_alienvault(key):
-    if not key: return []
-    out = []
-    try:
-        r = requests.get(
-            "https://otx.alienvault.com/api/v1/pulses/subscribed",
-            params={"limit":50,"modified_since":
-                    (datetime.utcnow()-timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")},
-            headers={**_H,"X-OTX-API-KEY":key},timeout=12)
-        if not r.ok: return []
-        for p in r.json().get("results",[]):
-            title   = (p.get("name","") or "").strip()
-            desc    = (p.get("description","") or "").strip()
-            tags    = " ".join(p.get("tags",[]))
-            text    = f"{title} {desc} {tags}"
-            if not (_IT_RE.search(text) or _ORGS_IT.search(text)): continue
-            if not _INCIDENT_RE.search(text): continue
-            link    = f"https://otx.alienvault.com/pulse/{p.get('id','')}"
-            pub     = _parse_dt(p.get("modified","") or p.get("created",""))
-            out.append(_item(title,desc[:300],link,"AlienVault OTX",pub,tags,stype="THREAT"))
-    except: pass
-    return out
+    return items
 
-def _f_newsapi(key):
-    if not key: return []
-    out = []
-    # Query specifiche per incidenti reali — non notizie generiche
-    queries = [
-        "\"attacco informatico\" Italia",
-        "\"data breach\" Italia \"hackerata\"",
-        "\"ransomware\" Italia \"colpita\"",
-        "\"violazione dati\" Italia",
-        "hacked Italy organization",
-        "\"cyber attack\" Italy \"hospital\" OR \"university\" OR \"government\"",
-    ]
-    for q in queries:
-        try:
-            r = requests.get("https://newsapi.org/v2/everything",
-                params={"q":q,"sortBy":"publishedAt","pageSize":20,"apiKey":key},
-                timeout=10,headers=_H)
-            if not r.ok: continue
-            for a in r.json().get("articles",[]):
-                title   = (a.get("title","") or "").strip()
-                desc    = (a.get("description","") or "").strip()
-                content = (a.get("content","") or "").strip()
-                link    = a.get("url","#")
-                pub     = _parse_dt(a.get("publishedAt",""))
-                combined = f"{title} {desc} {content}"
-                if not _accept(title,combined,"NEWS"): continue
-                out.append(_item(title,f"{desc} {content[:200]}".strip(),
-                                 link,"NewsAPI",pub,stype="NEWS"))
-        except: continue
-    return out
 
-# ─────────────────────────────────────────────────────────────────────
-#  MASTER FETCH
-# ─────────────────────────────────────────────────────────────────────
-def _fetch_all():
-    try:    keys = {k: st.secrets.get(k,"") for k in ["NEWSAPI_KEY","ALIENVAULT_KEY"]}
-    except: keys = {k: os.environ.get(k,"") for k in ["NEWSAPI_KEY","ALIENVAULT_KEY"]}
-
-    batches = [
-        _f_ransomware_live,
-        _f_hackmanac,
-        _f_cert_agid,
-        _f_rhc,
-        _f_cs360,
-        _f_bleeping,
-        _f_databreaches,
-        _f_threatpost,
-        _f_urlhaus,
-        _f_threatfox,
-        _f_feodo,
-        lambda: _f_alienvault(keys.get("ALIENVAULT_KEY","")),
-        lambda: _f_newsapi(keys.get("NEWSAPI_KEY","")),
-    ]
-    out = []
-    for fn in batches:
-        try: out.extend(fn())
+def _all_items():
+    """Raccoglie da tutte le fonti, deduplica, ordina."""
+    raw = []
+    for fn in [fetch_ransomware_live, fetch_cyberwatch,
+               fetch_rss_sources, fetch_abuse_ch]:
+        try: raw.extend(fn())
         except: pass
-    return out
+
+    # Dedup per id
+    seen, out = set(), []
+    for item in raw:
+        if item["id"] not in seen:
+            seen.add(item["id"])
+            out.append(item)
+
+    # Ordina per data decrescente
+    out.sort(key=lambda x: x.get("pub", _now()), reverse=True)
+    return out[:500]
 
 # ─────────────────────────────────────────────────────────────────────
-#  BACKGROUND THREAD
+#  MAP
 # ─────────────────────────────────────────────────────────────────────
-_started = threading.Event()
+SC = {"critical":"#ff3b30","medium":"#ff9f0a","low":"#30d158"}
+SG = {"critical":"rgba(255,59,48,.14)","medium":"rgba(255,159,10,.14)","low":"rgba(48,209,88,.14)"}
+SS = {"critical":14,"medium":10,"low":8}
+SGS= {"critical":28,"medium":21,"low":15}
 
-def _loop():
-    store: dict[str,dict] = {}
-    while True:
-        for item in _fetch_all():
-            dk = item["dk"]
-            if dk in store:
-                store[dk] = _merge(store[dk], item)
-            else:
-                store[dk] = item
-        # Sort + trim
-        sorted_items = sorted(store.values(),
-                               key=lambda x: x.get("pub",""), reverse=True)[:MAX_ITEMS]
-        store = {i["dk"]: i for i in sorted_items}
-        _write(sorted_items)
-        time.sleep(FETCH_INT)
+@st.cache_data(ttl=30, show_spinner=False)
+def build_map(attack_tuples):
+    """attack_tuples è una lista di tuple (hashable) per compatibilità cache."""
+    attacks = [dict(zip(
+        ["id","title","summary","link","source","sev","lat","lon","place","region","pub","ts"],
+        t)) for t in attack_tuples]
 
-def _ensure():
-    if not _started.is_set():
-        _started.set()
-        threading.Thread(target=_loop,daemon=True,name="CyberFetch").start()
-
-# ─────────────────────────────────────────────────────────────────────
-#  MAP — aggiunge SOLO i marker nuovi senza rebuilding completo
-# ─────────────────────────────────────────────────────────────────────
-SEV_C = {"critical":"#ff3b30","medium":"#ff9f0a","low":"#30d158"}
-SEV_G = {"critical":"rgba(255,59,48,.14)","medium":"rgba(255,159,10,.14)","low":"rgba(48,209,88,.14)"}
-SEV_S = {"critical":14,"medium":10,"low":8}
-SEV_GS= {"critical":28,"medium":21,"low":15}
-
-def build_map(attacks):
-    df = pd.DataFrame(attacks) if attacks else pd.DataFrame(
-        columns=["lat","lon","title","place","region","severity","ts","source","link"])
     fig = go.Figure()
+    df  = pd.DataFrame(attacks) if attacks else pd.DataFrame()
+
     for sev in ["critical","medium","low"]:
-        sub = df[df["severity"]==sev] if len(df) else pd.DataFrame()
+        sub = df[df["sev"]==sev] if len(df) else pd.DataFrame()
         if sub.empty: continue
         hover = [
-            f"<b>{r['title'][:72]}{'…'if len(r['title'])>72 else''}</b><br>"
+            f"<b>{r['title'][:70]}{'…'if len(r['title'])>70 else''}</b><br>"
             f"<span style='color:#7eb3d4'>📍 {r['place']} — {r['region']}</span><br>"
             f"<span style='color:#586374'>🕒 {r['ts']} · {r['source']}</span><br>"
-            f"<span style='color:{SEV_C[sev]};font-weight:600;font-size:10px'>▲ {sev.upper()}</span>"
-            for _,r in sub.iterrows()
+            f"<span style='color:{SC[sev]};font-weight:600'>▲ {sev.upper()}</span>"
+            for _, r in sub.iterrows()
         ]
-        lons,lats = sub["lon"].tolist(),sub["lat"].tolist()
-        links = sub["link"].tolist() if "link" in sub.columns else []
-        fig.add_trace(go.Scattermapbox(lon=lons,lat=lats,mode="markers",
-            name=f"_g{sev}",marker=dict(size=SEV_GS[sev],color=SEV_G[sev],opacity=.5),
-            hoverinfo="skip",showlegend=False))
-        fig.add_trace(go.Scattermapbox(lon=lons,lat=lats,mode="markers",
-            name=f"_m{sev}",marker=dict(size=int(SEV_GS[sev]*.56),color=SEV_G[sev],opacity=.38),
-            hoverinfo="skip",showlegend=False))
+        lons, lats = sub["lon"].tolist(), sub["lat"].tolist()
+        links = sub["link"].tolist()
+        fig.add_trace(go.Scattermapbox(lon=lons,lat=lats,mode="markers",name=f"_g{sev}",
+            marker=dict(size=SGS[sev],color=SG[sev],opacity=.5),hoverinfo="skip",showlegend=False))
+        fig.add_trace(go.Scattermapbox(lon=lons,lat=lats,mode="markers",name=f"_m{sev}",
+            marker=dict(size=int(SGS[sev]*.55),color=SG[sev],opacity=.35),hoverinfo="skip",showlegend=False))
         fig.add_trace(go.Scattermapbox(lon=lons,lat=lats,mode="markers",name=sev.upper(),
-            marker=dict(size=SEV_S[sev],color=SEV_C[sev],opacity=.95),
+            marker=dict(size=SS[sev],color=SC[sev],opacity=.95),
             text=hover,hovertemplate="%{text}<extra></extra>",customdata=links))
+
     fig.update_layout(
         paper_bgcolor="#0a0c0f",plot_bgcolor="#0a0c0f",height=650,
         margin=dict(l=0,r=0,t=0,b=0),
@@ -845,195 +572,185 @@ def build_map(attacks):
                     font=dict(family="IBM Plex Mono",size=10,color="#c8d0dc"),itemsizing="constant"),
         hoverlabel=dict(bgcolor="#0f1318",bordercolor="#2a3540",
                         font=dict(family="IBM Plex Sans",size=12,color="#c8d0dc"),align="left"),
-        dragmode="pan",uirevision="italy_map",  # <-- mantiene zoom/pan tra rerun
+        dragmode="pan",
+        uirevision="italy_map",   # zoom/pan persistente tra rerun
     )
     for tr in fig.data:
-        if tr.name and tr.name.startswith("_"): tr.showlegend=False
+        if tr.name and tr.name.startswith("_"): tr.showlegend = False
     return fig
 
 # ─────────────────────────────────────────────────────────────────────
-#  SIDEBAR
+#  FEED HTML
 # ─────────────────────────────────────────────────────────────────────
-def sidebar(attacks):
-    with st.sidebar:
-        st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.7rem;
-          color:#586374;letter-spacing:.12em;text-transform:uppercase;
-          padding:4px 0 16px 0;border-bottom:1px solid #1e2730;margin-bottom:16px;'>
-          ◈ FILTERS</div>""",unsafe_allow_html=True)
-
-        sel_sev = st.multiselect("SEVERITY",["critical","medium","low"],
-                                 default=["critical","medium","low"],format_func=str.upper)
-        st.markdown("<div style='height:7px'></div>",unsafe_allow_html=True)
-
-        avail_reg = sorted(set(a["region"] for a in attacks)) if attacks else sorted(REGIONS)
-        sel_reg   = st.multiselect("REGION",avail_reg,default=[],placeholder="All regions")
-        st.markdown("<div style='height:7px'></div>",unsafe_allow_html=True)
-
-        today = datetime.now().date()
-        c1,c2 = st.columns(2)
-        with c1: df_ = st.date_input("FROM",value=today-timedelta(days=7))
-        with c2: dt_ = st.date_input("TO",  value=today)
-        st.markdown("<div style='height:7px'></div>",unsafe_allow_html=True)
-
-        avail_src = sorted(set(a["source"] for a in attacks)) if attacks else []
-        sel_src   = st.multiselect("SOURCE",avail_src,default=[],placeholder="All sources")
-        st.markdown("<div style='height:7px'></div>",unsafe_allow_html=True)
-
-        search = st.text_input("🔍 SEARCH",placeholder="sapienza, ransomware, milano…")
-        st.markdown("<hr style='border-color:#1e2730;margin:14px 0'>",unsafe_allow_html=True)
-        if st.button("↺  RESET"): st.rerun()
-
-        st.markdown(f"""<div style='font-family:"IBM Plex Mono",monospace;font-size:.56rem;
-          color:#586374;margin-top:18px;line-height:1.9;'>
-          <span style='color:#30d158'>● FONTI ATTIVE</span><br>
-          · Ransomware.live API<br>· Hackmanac/Cyberwatch-IT<br>
-          · CERT-AgID · CSIRT Italia<br>· Red Hot Cyber · Cybersecurity360<br>
-          · BleepingComputer · DataBreaches.net<br>
-          · Threatpost · THN · DarkReading<br>
-          · Krebs · SecurityWeek · TheRecord<br>
-          · Infosecurity Magazine · HelpNet<br>
-          · URLhaus · ThreatFox · Feodo<br>
-          · AlienVault OTX (key opz.)<br>
-          · NewsAPI (key opz.)<br>
-          <br><span style='color:#ff9f0a'>● FETCH:</span> ogni {FETCH_INT}s<br>
-          <span style='color:#ff3b30'>● UI POLL:</span> ogni {POLL_MS//1000}s<br>
-          <span style='color:#30d158'>● IPC:</span> file JSON — no reload
-        </div>""",unsafe_allow_html=True)
-    return sel_sev,sel_reg,df_,dt_,sel_src,search
-
-def _filter(attacks,sel_sev,sel_reg,df_,dt_,sel_src,search):
-    f = attacks
-    if sel_sev: f=[a for a in f if a["severity"] in sel_sev]
-    if sel_reg: f=[a for a in f if a["region"]   in sel_reg]
-    if sel_src: f=[a for a in f if a["source"]   in sel_src]
-    f=[a for a in f if isinstance(a.get("pub_dt"),datetime)
-       and df_<=a["pub_dt"].date()<=dt_]
-    if search:
-        q=search.lower()
-        f=[a for a in f if q in a["title"].lower() or q in a["summary"].lower()
-           or q in a["place"].lower() or q in a["source"].lower()]
-    return f
-
-# ─────────────────────────────────────────────────────────────────────
-#  FEED HTML — render puro, nessun re-render Streamlit
-# ─────────────────────────────────────────────────────────────────────
-def _card_html(a) -> str:
-    sev  = a["severity"]
+def _card(a, is_new=False):
+    sev  = a["sev"]
     cls  = "" if sev=="critical" else sev
-    new  = "is-new" if a.get("is_new") else ""
+    nw   = "nw" if is_new else ""
     link = a.get("link","#")
-    badge_new = '<span class="bx bn">● NEW</span>' if a.get("is_new") else ""
-    upd_badge = (f'<span style="color:#586374;font-size:.56rem">↑{a["upd"]}×</span> '
-                 if a.get("upd",0)>0 else "")
-    return f"""<div class="fc {cls} {new}">
-  <div class="ft"><a href="{link}" target="_blank">{a['title']}</a></div>
-  <div class="fm">{badge_new}{upd_badge}<span class="bx b{sev[0]}">{sev}</span>
-    <span class="bx br">{a['region']}</span>
-    <span class="bx bs">{a['source']}</span>
-    📍 {a['place']} &nbsp;·&nbsp; {a['ts']}</div>
-  <div class="fd">{a['summary'][:260]}{'…'if len(a['summary'])>260 else''}</div>
-</div>"""
-
-def render_feed(attacks):
-    if not attacks:
-        st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.75rem;
-          color:#586374;text-align:center;padding:40px 0;'>
-          <div style='font-size:1.4rem;margin-bottom:8px'>◌</div>
-          FETCHING FEED IN CORSO…<br>
-          <span style='font-size:.6rem'>prima notizia in ~{FETCH_INT}s</span>
-        </div>""",unsafe_allow_html=True)
-        return
-    html = '<div class="feed-wrap">'+"".join(_card_html(a) for a in attacks[:200])+"</div>"
-    st.markdown(html, unsafe_allow_html=True)
+    bn   = '<span class="bx bn">● NEW</span> ' if is_new else ""
+    bc   = {"critical":"bc","medium":"bm","low":"bl"}[sev]
+    return (
+        f'<div class="fc {cls} {nw}">'
+        f'<div class="ft"><a href="{link}" target="_blank">{a["title"]}</a></div>'
+        f'<div class="fm">{bn}<span class="bx {bc}">{sev}</span>'
+        f'<span class="bx br">{a["region"]}</span>'
+        f'<span class="bx bs">{a["source"]}</span>'
+        f'📍 {a["place"]} &nbsp;·&nbsp; {a["ts"]}</div>'
+        f'<div class="fd">{a["summary"][:260]}{"…"if len(a["summary"])>260 else""}</div>'
+        f'</div>'
+    )
 
 # ─────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────
 def main():
-    _ensure()
+    # ── Autorefresh ogni 30s — triggera rerun → cache scaduta → nuovo fetch
+    # Messo DOPO set_page_config e CSS, prima del contenuto
+    if HAS_AR:
+        st_autorefresh(interval=30_000, limit=None, key="ar")
 
-    all_attacks = _read()
-    now = datetime.now(TZ)
+    # ── Fetch dati ────────────────────────────────────────────────────
+    attacks = _all_items()
+
+    # ── Traccia nuovi (vs sessione precedente) ────────────────────────
+    prev_ids = st.session_state.get("prev_ids", set())
+    new_ids  = {a["id"] for a in attacks} - prev_ids
+    st.session_state["prev_ids"] = {a["id"] for a in attacks}
 
     # ── Header ────────────────────────────────────────────────────────
-    st.markdown("""<div style='display:flex;align-items:center;margin-bottom:4px;'>
-      <div style='font-family:"IBM Plex Mono",monospace;font-size:1.5rem;
-                  font-weight:600;color:#e8ecf0;letter-spacing:-.02em;'>
-        <span style='color:#ff3b30'>◈</span> ITALY CYBER THREAT MAP
-      </div>
-      <div style='margin-left:auto;font-family:"IBM Plex Mono",monospace;
-                  font-size:.6rem;color:#586374;letter-spacing:.08em;'>
-        LIVE INCIDENT TRACKER
-      </div>
-    </div>""",unsafe_allow_html=True)
+    now = datetime.now(ZoneInfo("Europe/Rome"))
+    st.markdown(
+        f"""<div style='display:flex;align-items:center;margin-bottom:4px;'>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:1.45rem;
+                      font-weight:600;color:#e8ecf0;letter-spacing:-.02em;'>
+            <span style='color:#ff3b30'>◈</span> ITALY CYBER THREAT MAP
+          </div>
+          <div style='margin-left:auto;font-family:"IBM Plex Mono",monospace;
+                      font-size:.6rem;color:#586374;'>LIVE INCIDENT TRACKER</div>
+        </div>""", unsafe_allow_html=True)
 
-    # Autorefresh ogni 4s — dopo il primo render, nessun crash
-    if HAS_AR:
-        st_autorefresh(interval=POLL_MS, limit=None, key="poll")
+    # ── Sidebar ───────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.7rem;
+          color:#586374;letter-spacing:.12em;text-transform:uppercase;
+          padding:4px 0 14px;border-bottom:1px solid #1e2730;margin-bottom:14px;'>
+          ◈ FILTERS</div>""", unsafe_allow_html=True)
 
-    sel_sev,sel_reg,df_,dt_,sel_src,search = sidebar(all_attacks)
-    filtered = _filter(all_attacks,sel_sev,sel_reg,df_,dt_,sel_src,search)
+        sel_sev = st.multiselect("SEVERITY", ["critical","medium","low"],
+                                 default=["critical","medium","low"], format_func=str.upper)
+        avail_reg = sorted(set(a["region"] for a in attacks)) if attacks else ALL_REGIONS
+        sel_reg   = st.multiselect("REGION", avail_reg, default=[], placeholder="All regions")
 
-    total  = len(all_attacks)
-    crit   = sum(1 for a in all_attacks if a["severity"]=="critical")
-    med    = sum(1 for a in all_attacks if a["severity"]=="medium")
-    low    = sum(1 for a in all_attacks if a["severity"]=="low")
-    reg_n  = len(set(a["region"] for a in all_attacks))
-    new_n  = sum(1 for a in all_attacks if a.get("is_new"))
+        today = datetime.now().date()
+        c1,c2 = st.columns(2)
+        with c1: d_from = st.date_input("FROM", value=today-timedelta(days=30))
+        with c2: d_to   = st.date_input("TO",   value=today)
+
+        avail_src = sorted(set(a["source"] for a in attacks)) if attacks else []
+        sel_src   = st.multiselect("SOURCE", avail_src, default=[], placeholder="All sources")
+        search    = st.text_input("🔍 SEARCH", placeholder="sapienza, lockbit, napoli…")
+
+        st.markdown("<hr style='border-color:#1e2730;margin:12px 0'>", unsafe_allow_html=True)
+        if st.button("↺  RESET"): st.rerun()
+
+        n_new = len(new_ids)
+        st.markdown(f"""<div style='font-family:"IBM Plex Mono",monospace;font-size:.56rem;
+          color:#586374;margin-top:16px;line-height:1.9;'>
+          <span style='color:#30d158'>● {n_new} nuovi eventi</span><br>
+          FONTI:<br>
+          · Ransomware.live API<br>· Cyberwatch-IT (GitHub)<br>
+          · CERT-AgID · CSIRT Italia<br>· Red Hot Cyber · Cybersecurity360<br>
+          · BleepingComputer · DataBreaches.net<br>
+          · The Hacker News · DarkReading<br>
+          · Krebs · SecurityWeek · TheRecord<br>
+          · Infosecurity · HelpNet · Threatpost<br>
+          · URLhaus · ThreatFox · Feodo Tracker<br>
+          <br>
+          <span style='color:#ff9f0a'>CACHE TTL:</span> 30s<br>
+          <span style='color:#ff3b30'>AUTOREFRESH:</span> {"30s" if HAS_AR else "manuale"}
+        </div>""", unsafe_allow_html=True)
+
+    # ── Filtro ────────────────────────────────────────────────────────
+    filtered = attacks
+    if sel_sev: filtered = [a for a in filtered if a["sev"] in sel_sev]
+    if sel_reg: filtered = [a for a in filtered if a["region"] in sel_reg]
+    if sel_src: filtered = [a for a in filtered if a["source"] in sel_src]
+    filtered = [a for a in filtered
+                if d_from <= a["pub"].date() <= d_to]
+    if search:
+        q = search.lower()
+        filtered = [a for a in filtered
+                    if q in a["title"].lower() or q in a["summary"].lower()
+                    or q in a["place"].lower() or q in a["source"].lower()]
+
+    # ── KPI ──────────────────────────────────────────────────────────
+    tot   = len(attacks)
+    crit  = sum(1 for a in attacks if a["sev"]=="critical")
+    med   = sum(1 for a in attacks if a["sev"]=="medium")
+    low   = sum(1 for a in attacks if a["sev"]=="low")
+    regs  = len(set(a["region"] for a in attacks))
 
     k1,k2,k3,k4,k5 = st.columns(5)
-    k1.metric("INCIDENTI TOTALI",total)
-    k2.metric("⬤ CRITICAL",crit)
-    k3.metric("⬤ MEDIUM",med)
-    k4.metric("⬤ LOW",low)
-    k5.metric("REGIONI COLPITE",reg_n)
+    k1.metric("INCIDENTI", tot)
+    k2.metric("⬤ CRITICAL", crit)
+    k3.metric("⬤ MEDIUM", med)
+    k4.metric("⬤ LOW", low)
+    k5.metric("REGIONI", regs)
 
-    st.markdown("<div style='height:3px'></div>",unsafe_allow_html=True)
+    # ── Status bar ────────────────────────────────────────────────────
+    last_ts = attacks[0]["ts"] if attacks else "—"
+    nxt = 30 - (int(time.time()) % 30)
+    new_html = (f' · <span style="color:#30d158;font-weight:600">+{len(new_ids)} nuovi</span>'
+                if new_ids else "")
+    st.markdown(
+        f"""<div class="sbar"><span class="pulse"></span>
+        LIVE · {now.strftime('%d/%m/%Y %H:%M:%S')} IT ·
+        {len(filtered)} eventi (filtrati) · {tot} totali ·
+        ultimo: {last_ts} · refresh ~{nxt}s{new_html}</div>""",
+        unsafe_allow_html=True)
 
-    age_s = ""
-    if all_attacks:
-        last = all_attacks[0].get("pub_dt")
-        if isinstance(last,datetime):
-            delta = int((now-last).total_seconds())
-            age_s = f" · ultima notizia {delta}s fa"
-
-    new_html = (f" · <span style='color:#30d158;font-weight:600'>+{new_n} nuovi</span>"
-                if new_n>0 else "")
-    nxt = FETCH_INT-(int(time.time())%FETCH_INT)
-    st.markdown(f"""<div class="sbar">
-      <span class="pulse"></span>LIVE · {now.strftime('%d/%m/%Y %H:%M:%S')} IT ·
-      {len(filtered)} eventi (filtrati) · {total} in storico ·
-      next fetch ~{nxt}s{age_s}{new_html}
-    </div>""",unsafe_allow_html=True)
-
-    map_col,feed_col = st.columns([3,1.5],gap="medium")
+    # ── Layout ────────────────────────────────────────────────────────
+    map_col, feed_col = st.columns([3, 1.5], gap="medium")
 
     with map_col:
-        # key="cybermap" + uirevision="italy_map" → Plotly non rebuilda il DOM
-        # aggiunge solo i trace nuovi senza flickering
-        st.plotly_chart(build_map(filtered),use_container_width=True,
-            key="cybermap",
-            config={"scrollZoom":True,"displayModeBar":True,"displaylogo":False,
-                    "modeBarButtonsToRemove":["select2d","lasso2d","autoScale2d","resetScale2d"],
-                    "toImageButtonOptions":{"format":"png","filename":"italy_cybermap"}})
+        # Converti in tuple per hash → compatibile con st.cache_data
+        tups = tuple(
+            (a["id"],a["title"],a["summary"],a["link"],a["source"],
+             a["sev"],a["lat"],a["lon"],a["place"],a["region"],a["pub"],a["ts"])
+            for a in filtered
+        )
+        fig = build_map(tups)
+        st.plotly_chart(fig, use_container_width=True,
+                        config={"scrollZoom":True,"displayModeBar":True,"displaylogo":False,
+                                "modeBarButtonsToRemove":["select2d","lasso2d"],
+                                "toImageButtonOptions":{"format":"png","filename":"italy_cybermap"}})
         st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.6rem;
           color:#586374;text-align:center;margin-top:-8px;'>
-          CLICK MARKER → REPORT · SCROLL TO ZOOM · DRAG TO PAN
-        </div>""",unsafe_allow_html=True)
+          CLICK MARKER → REPORT · SCROLL TO ZOOM · DRAG TO PAN</div>""",
+                    unsafe_allow_html=True)
 
     with feed_col:
-        st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.65rem;
+        st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.63rem;
           color:#586374;letter-spacing:.1em;text-transform:uppercase;
           padding-bottom:8px;border-bottom:1px solid #1e2730;margin-bottom:10px;'>
-          ◈ INCIDENT FEED — REAL-TIME
-        </div>""",unsafe_allow_html=True)
-        with st.container(height=655):
-            render_feed(filtered)
+          ◈ INCIDENT FEED</div>""", unsafe_allow_html=True)
 
+        if not filtered:
+            st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:.75rem;
+              color:#586374;text-align:center;padding:40px 0;'>
+              <div style='font-size:1.4rem;margin-bottom:8px'>◌</div>
+              CARICAMENTO IN CORSO…</div>""", unsafe_allow_html=True)
+        else:
+            html = "".join(_card(a, is_new=(a["id"] in new_ids)) for a in filtered[:150])
+            with st.container(height=655):
+                st.markdown(html, unsafe_allow_html=True)
+
+    # ── Avviso se no autorefresh ──────────────────────────────────────
     if not HAS_AR:
-        st.info("⚠️ streamlit-autorefresh non installato. "
-                "Aggiungi 'streamlit-autorefresh' a requirements.txt per aggiornamento automatico. "
-                "Aggiorna manualmente la pagina per vedere nuovi eventi.")
+        st.warning(
+            "streamlit-autorefresh non trovato — aggiungi 'streamlit-autorefresh' "
+            "a requirements.txt e riavvia l'app per aggiornamento automatico."
+        )
 
-# Always call main (works on Streamlit Cloud and locally)
+
 main()
