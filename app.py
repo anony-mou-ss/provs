@@ -952,11 +952,6 @@ def render_feed(attacks):
 def main():
     _ensure()
 
-    # Autorefresh ogni 4s — Streamlit rerun, legge file aggiornato
-    # uirevision="italy_map" nella mappa garantisce che zoom/pan non resetta
-    if HAS_AR:
-        st_autorefresh(interval=POLL_MS,limit=None,key="poll")
-
     all_attacks = _read()
     now = datetime.now(TZ)
 
@@ -971,6 +966,10 @@ def main():
         LIVE INCIDENT TRACKER
       </div>
     </div>""",unsafe_allow_html=True)
+
+    # Autorefresh ogni 4s — dopo il primo render, nessun crash
+    if HAS_AR:
+        st_autorefresh(interval=POLL_MS, limit=None, key="poll")
 
     sel_sev,sel_reg,df_,dt_,sel_src,search = sidebar(all_attacks)
     filtered = _filter(all_attacks,sel_sev,sel_reg,df_,dt_,sel_src,search)
@@ -1032,10 +1031,9 @@ def main():
             render_feed(filtered)
 
     if not HAS_AR:
-        st.markdown(f"<script>setTimeout(()=>window.location.reload(),{POLL_MS})</script>",
-                    unsafe_allow_html=True)
-        st.warning("Installa streamlit-autorefresh per aggiornamento senza reload: "
-                   "`pip install streamlit-autorefresh`")
+        st.info("⚠️ streamlit-autorefresh non installato. "
+                "Aggiungi 'streamlit-autorefresh' a requirements.txt per aggiornamento automatico. "
+                "Aggiorna manualmente la pagina per vedere nuovi eventi.")
 
-if __name__=="__main__":
-    main()
+# Always call main (works on Streamlit Cloud and locally)
+main()
