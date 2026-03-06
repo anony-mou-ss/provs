@@ -1,5 +1,6 @@
-streamlit
-requests
-folium
-streamlit-folium
-pandas
+streamlit>=1.35
+plotly>=5.18
+requests>=2.31
+feedparser>=6.0
+pandas>=2.0
+pytz>=2024
