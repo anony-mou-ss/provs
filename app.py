@@ -5,15 +5,11 @@
 ╚══════════════════════════════════════════════════════════════════╝
 
 Usage:
-    pip install fastapi uvicorn asyncpg python-dotenv
+    pip install fastapi uvicorn httpx python-dotenv
     python app.py
 
 Environment variables (.env):
-    DB_HOST=localhost
-    DB_PORT=5432
-    DB_NAME=cyber_intel
-    DB_USER=postgres
-    DB_PASSWORD=password
+    WEBHOOK_URL=https://hierocratic-subumbellate-dionna.ngrok-free.dev/webhook/cyber-news
     POLL_INTERVAL=5
 """
 
@@ -29,9 +25,9 @@ from typing import Optional
 import uvicorn
 
 try:
-    import asyncpg
+    import httpx
 except ImportError:
-    print("Missing dependency: pip install asyncpg")
+    print("Missing dependency: pip install httpx")
     sys.exit(1)
 
 try:
@@ -53,157 +49,190 @@ logger = logging.getLogger(__name__)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-DB_HOST     = os.getenv("DB_HOST", "localhost")
-DB_PORT     = int(os.getenv("DB_PORT", "5432"))
-DB_NAME     = os.getenv("DB_NAME", "cyber_intel")
-DB_USER     = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+WEBHOOK_URL   = os.getenv("WEBHOOK_URL", "https://hierocratic-subumbellate-dionna.ngrok-free.dev/webhook/cyber-news")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 
-# ─── DATABASE ────────────────────────────────────────────────────────────────
+# ─── DATA LAYER — HTTP webhook (n8n → ngrok) ─────────────────────────────────
+# All data comes from the n8n webhook. The webhook must return a JSON array
+# of cyber_news records (same fields as the original DB schema).
+# n8n handles the DB; this app only reads via HTTP GET to WEBHOOK_URL.
 
-pool: Optional[asyncpg.Pool] = None
-
-
-async def get_pool() -> asyncpg.Pool:
-    global pool
-    if pool is None:
-        pool = await asyncpg.create_pool(
-            host=DB_HOST, port=DB_PORT,
-            database=DB_NAME, user=DB_USER,
-            password=DB_PASSWORD, min_size=2, max_size=10,
-        )
-    return pool
+_http_client: Optional[httpx.AsyncClient] = None
 
 
-def rec(r) -> dict:
-    """Convert asyncpg Record to JSON-safe dict."""
-    if r is None:
-        return {}
-    d = dict(r)
-    for k, v in d.items():
-        if isinstance(v, datetime):
-            d[k] = v.isoformat()
-    return d
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=15.0, headers={"ngrok-skip-browser-warning": "true"})
+    return _http_client
 
 
-async def db_get_events(attack_type=None, sector=None, severity=None, limit=200) -> list:
-    p = await get_pool()
-    conds, args, i = ["latitude IS NOT NULL", "longitude IS NOT NULL"], [], 1
-    if attack_type:
-        conds.append(f"attack_type ILIKE ${i}"); args.append(f"%{attack_type}%"); i += 1
-    if sector:
-        conds.append(f"sector ILIKE ${i}"); args.append(f"%{sector}%"); i += 1
-    if severity:
-        conds.append(f"severity ILIKE ${i}"); args.append(f"%{severity}%"); i += 1
-    where = " AND ".join(conds)
-    args.append(limit)
-    rows = await p.fetch(
-        f"SELECT * FROM cyber_news WHERE {where} ORDER BY created_at DESC LIMIT ${i}",
-        *args
-    )
-    return [rec(r) for r in rows]
+async def fetch_all() -> list:
+    """Fetch all records from the n8n webhook. Returns list of dicts."""
+    try:
+        r = await get_http_client().get(WEBHOOK_URL)
+        r.raise_for_status()
+        data = r.json()
+        # n8n may return a list directly or wrapped in a key
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("data", "events", "records", "items", "cyber_news"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+        return []
+    except Exception as e:
+        logger.error(f"Webhook fetch error: {e}")
+        return []
 
 
-async def db_get_recent(limit=20) -> list:
-    p = await get_pool()
-    rows = await p.fetch(
-        "SELECT id, title, attack_type, sector, severity, target, source, link, created_at, latitude, longitude "
-        "FROM cyber_news ORDER BY created_at DESC LIMIT $1", limit
-    )
-    return [rec(r) for r in rows]
+def _match(ev: dict, field: str, value: Optional[str]) -> bool:
+    if not value:
+        return True
+    return value.lower() in (ev.get(field) or "").lower()
 
 
-async def db_get_stats() -> dict:
-    p = await get_pool()
+def _compute_stats(events: list) -> dict:
     now = datetime.utcnow()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week  = now - timedelta(days=7)
     month = now - timedelta(days=30)
-    row = await p.fetchrow("""
-        SELECT
-            COUNT(*) FILTER (WHERE created_at >= $1) AS today,
-            COUNT(*) FILTER (WHERE created_at >= $2) AS week,
-            COUNT(*) FILTER (WHERE created_at >= $3) AS month,
-            COUNT(*) FILTER (WHERE severity = 'critical') AS critical,
-            COUNT(*) AS total
-        FROM cyber_news
-    """, today, week, month)
-    return rec(row)
+
+    def ts(ev):
+        raw = ev.get("created_at")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    cnt_today = cnt_week = cnt_month = cnt_crit = 0
+    for ev in events:
+        t = ts(ev)
+        sev = (ev.get("severity") or "").lower()
+        if sev == "critical":
+            cnt_crit += 1
+        if t:
+            if t >= today:  cnt_today += 1
+            if t >= week:   cnt_week  += 1
+            if t >= month:  cnt_month += 1
+
+    return {"today": cnt_today, "week": cnt_week, "month": cnt_month,
+            "critical": cnt_crit, "total": len(events)}
+
+
+def _group_count(events: list, field: str, limit: int = 10) -> list:
+    counts: dict = {}
+    for ev in events:
+        val = (ev.get(field) or "").strip()
+        if val:
+            counts[val] = counts.get(val, 0) + 1
+    return [{field: k, "count": v}
+            for k, v in sorted(counts.items(), key=lambda x: -x[1])[:limit]]
+
+
+def _timeline_24h(events: list) -> list:
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    buckets: dict = {}
+    for ev in events:
+        raw = ev.get("created_at")
+        if not raw:
+            continue
+        try:
+            t = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            continue
+        if t < cutoff:
+            continue
+        hour_key = t.replace(minute=0, second=0, microsecond=0).isoformat()
+        buckets[hour_key] = buckets.get(hour_key, 0) + 1
+    return [{"hour": h, "count": c} for h, c in sorted(buckets.items())]
+
+
+# Public API used by the rest of the app — same signatures as before
+
+async def db_get_events(attack_type=None, sector=None, severity=None, limit=200) -> list:
+    events = await fetch_all()
+    out = []
+    for ev in events:
+        if not ev.get("latitude") or not ev.get("longitude"):
+            continue
+        if not _match(ev, "attack_type", attack_type): continue
+        if not _match(ev, "sector",      sector):      continue
+        if not _match(ev, "severity",    severity):    continue
+        out.append(ev)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def db_get_recent(limit=20) -> list:
+    events = await fetch_all()
+    return events[:limit]
+
+
+async def db_get_stats() -> dict:
+    events = await fetch_all()
+    return _compute_stats(events)
 
 
 async def db_get_sectors() -> list:
-    p = await get_pool()
-    rows = await p.fetch("""
-        SELECT sector, COUNT(*) AS count
-        FROM cyber_news WHERE sector IS NOT NULL AND sector != ''
-        GROUP BY sector ORDER BY count DESC LIMIT 10
-    """)
-    return [rec(r) for r in rows]
+    events = await fetch_all()
+    return _group_count(events, "sector")
 
 
 async def db_get_attack_types() -> list:
-    p = await get_pool()
-    rows = await p.fetch("""
-        SELECT attack_type, COUNT(*) AS count
-        FROM cyber_news WHERE attack_type IS NOT NULL AND attack_type != ''
-        GROUP BY attack_type ORDER BY count DESC LIMIT 10
-    """)
-    return [rec(r) for r in rows]
+    events = await fetch_all()
+    return _group_count(events, "attack_type")
 
 
 async def db_get_timeline() -> list:
-    p = await get_pool()
-    rows = await p.fetch("""
-        SELECT
-            date_trunc('hour', created_at) AS hour,
-            COUNT(*) AS count
-        FROM cyber_news
-        WHERE created_at >= NOW() - INTERVAL '24 hours'
-        GROUP BY hour ORDER BY hour
-    """)
-    return [rec(r) for r in rows]
+    events = await fetch_all()
+    return _timeline_24h(events)
 
 
 async def db_get_severity_dist() -> list:
-    p = await get_pool()
-    rows = await p.fetch("""
-        SELECT severity, COUNT(*) AS count
-        FROM cyber_news WHERE severity IS NOT NULL AND severity != ''
-        GROUP BY severity ORDER BY count DESC
-    """)
-    return [rec(r) for r in rows]
+    events = await fetch_all()
+    return _group_count(events, "severity")
 
 
 async def db_get_regions() -> list:
-    p = await get_pool()
-    rows = await p.fetch("""
-        SELECT target AS region, COUNT(*) AS count
-        FROM cyber_news
-        WHERE country ILIKE '%ital%' OR country = 'IT'
-        GROUP BY target ORDER BY count DESC LIMIT 15
-    """)
-    return [rec(r) for r in rows]
+    events = await fetch_all()
+    italian = [ev for ev in events
+               if "ital" in (ev.get("country") or "").lower() or
+               (ev.get("country") or "").upper() == "IT"]
+    counts: dict = {}
+    for ev in italian:
+        r = (ev.get("target") or "").strip()
+        if r:
+            counts[r] = counts.get(r, 0) + 1
+    return [{"region": k, "count": v}
+            for k, v in sorted(counts.items(), key=lambda x: -x[1])[:15]]
 
 
 async def db_get_since(ts: datetime) -> list:
-    p = await get_pool()
-    rows = await p.fetch(
-        "SELECT * FROM cyber_news WHERE created_at > $1 ORDER BY created_at ASC", ts
-    )
-    return [rec(r) for r in rows]
+    events = await fetch_all()
+    out = []
+    for ev in events:
+        raw = ev.get("created_at")
+        if not raw:
+            continue
+        try:
+            t = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+            if t > ts:
+                out.append(ev)
+        except Exception:
+            continue
+    return out
 
 
 async def db_get_filter_options() -> dict:
-    p = await get_pool()
-    at = await p.fetch("SELECT DISTINCT attack_type FROM cyber_news WHERE attack_type IS NOT NULL AND attack_type!='' ORDER BY attack_type")
-    se = await p.fetch("SELECT DISTINCT sector FROM cyber_news WHERE sector IS NOT NULL AND sector!='' ORDER BY sector")
-    sv = await p.fetch("SELECT DISTINCT severity FROM cyber_news WHERE severity IS NOT NULL AND severity!='' ORDER BY severity")
-    return {
-        "attack_types": [r["attack_type"] for r in at],
-        "sectors": [r["sector"] for r in se],
-        "severities": [r["severity"] for r in sv],
-    }
+    events = await fetch_all()
+    ats = sorted({(ev.get("attack_type") or "").strip() for ev in events if ev.get("attack_type")})
+    ses = sorted({(ev.get("sector")      or "").strip() for ev in events if ev.get("sector")})
+    svs = sorted({(ev.get("severity")    or "").strip() for ev in events if ev.get("severity")})
+    return {"attack_types": ats, "sectors": ses, "severities": svs}
 
 # ─── WEBSOCKET MANAGER ───────────────────────────────────────────────────────
 
@@ -287,18 +316,21 @@ poll_task = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global poll_task
+    # Warm up HTTP client and verify webhook connectivity
     try:
-        await get_pool()
-        logger.info("Database connected")
+        client = get_http_client()
+        r = await client.get(WEBHOOK_URL)
+        logger.info(f"Webhook reachable — status {r.status_code}, "
+                    f"{len(r.json()) if isinstance(r.json(), list) else '?'} records")
     except Exception as e:
-        logger.warning(f"DB connection failed (demo mode): {e}")
+        logger.warning(f"Webhook not reachable at startup (will retry): {e}")
     poll_task = asyncio.create_task(poller())
     yield
     if poll_task:
         poll_task.cancel()
-    global pool
-    if pool:
-        await pool.close()
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
 
 app = FastAPI(title="Cyber Intel Italy", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1370,12 +1402,9 @@ if __name__ == "__main__":
 ║  Dashboard: http://localhost:8000                            ║
 ║  API Docs:  http://localhost:8000/docs                       ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Required env vars (.env file or environment):               ║
-║    DB_HOST     = localhost                                    ║
-║    DB_PORT     = 5432                                        ║
-║    DB_NAME     = cyber_intel                                 ║
-║    DB_USER     = postgres                                     ║
-║    DB_PASSWORD = your_password                               ║
+║  Data source: n8n webhook via ngrok                          ║
+║  Configure via .env or environment:                          ║
+║    WEBHOOK_URL  = https://...ngrok.../webhook/cyber-news     ║
 ║    POLL_INTERVAL = 5  (seconds)                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
