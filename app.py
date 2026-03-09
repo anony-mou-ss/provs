@@ -11,7 +11,6 @@ requirements.txt:
 """
 
 import time
-import threading
 from datetime import datetime, timedelta
 
 import requests
@@ -90,43 +89,40 @@ label{color:#4a5568!important;font-size:.58rem!important;letter-spacing:2px!impo
 </style>
 """, unsafe_allow_html=True)
 
-# ── NON-BLOCKING FETCH ────────────────────────────────────────────────────────
+# ── FETCH (st.cache_data — si aggiorna ogni 30s automaticamente) ──────────────
 def _normalize(raw_list):
     """
-    Handle all n8n webhook response shapes:
-      - plain list of records
-      - list of {json: {...}, pairedItem: {...}} wrappers (n8n default)
-      - single dict
-    Also remap field names to match our schema:
-      type        -> attack_type
-      tlp         -> admiralty_code  (if admiralty_code absent)
+    Handle n8n webhook shapes:
+      - list of plain records
+      - list of {json: {...}, pairedItem: {...}} n8n wrappers
+    Remap: type->attack_type, tlp->admiralty_code, severity lowercase
     """
     out = []
     for item in raw_list:
-        # unwrap n8n pairedItem wrapper
         if isinstance(item, dict) and "json" in item and isinstance(item["json"], dict):
             rec = dict(item["json"])
         elif isinstance(item, dict):
             rec = dict(item)
         else:
             continue
-        # remap 'type' -> 'attack_type'
-        if "attack_type" not in rec or not rec.get("attack_type"):
+        if not rec.get("attack_type"):
             rec["attack_type"] = rec.get("type", "")
-        # remap 'tlp' -> 'admiralty_code'
-        if "admiralty_code" not in rec or not rec.get("admiralty_code"):
+        if not rec.get("admiralty_code"):
             rec["admiralty_code"] = rec.get("tlp", "")
-        # lowercase severity for consistency
         if rec.get("severity"):
             rec["severity"] = str(rec["severity"]).lower()
         out.append(rec)
     return out
 
-def _do_fetch():
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_fetch():
+    """Cached HTTP fetch — Streamlit reruns every 30s via autorefresh."""
     try:
-        r = requests.get(WEBHOOK_URL,
-                         headers={"ngrok-skip-browser-warning":"true"},
-                         timeout=TIMEOUT_S)
+        r = requests.get(
+            WEBHOOK_URL,
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=TIMEOUT_S,
+        )
         r.raise_for_status()
         data = r.json()
 
@@ -138,34 +134,35 @@ def _do_fetch():
                 if k in data and isinstance(data[k], list):
                     raw_list = data[k]
                     break
-            if not raw_list:
+            if not raw_list and data:
                 raw_list = [data]
 
         result = _normalize(raw_list)
-        status = "ok" if result else "empty"
+        return result, "ok" if result else "empty"
 
     except requests.exceptions.Timeout:
-        result = st.session_state.get("_ev", [])
-        status = "timeout"
+        return None, "timeout"
     except requests.exceptions.ConnectionError:
-        result = st.session_state.get("_ev", [])
-        status = "conn_error"
+        return None, "conn_error"
     except Exception as e:
-        result = st.session_state.get("_ev", [])
-        status = f"error:{str(e)[:80]}"
-    st.session_state["_ev"]      = result
-    st.session_state["_status"]  = status
-    st.session_state["_fetch_ts"]= datetime.utcnow()
-    st.session_state["_running"] = False
+        return None, f"error:{str(e)[:120]}"
 
 def get_data():
-    now  = datetime.utcnow()
-    last = st.session_state.get("_fetch_ts")
-    run  = st.session_state.get("_running", False)
-    if not run and (last is None or (now - last).total_seconds() > 29):
-        st.session_state["_running"] = True
-        threading.Thread(target=_do_fetch, daemon=True).start()
-    return st.session_state.get("_ev", []), st.session_state.get("_status", "loading")
+    """
+    Call cached fetch. On timeout/error, return last known good data
+    from session_state so the dashboard never goes blank.
+    """
+    result, status = _cached_fetch()
+
+    if result is not None:
+        # good fetch — update cache in session_state
+        st.session_state["_ev_cache"] = result
+        st.session_state["_last_ok"]  = datetime.utcnow()
+    else:
+        # bad fetch — use last known data
+        result = st.session_state.get("_ev_cache", [])
+
+    return result, status
 
 # ── DATA HELPERS ──────────────────────────────────────────────────────────────
 def parse_ts(raw):
@@ -367,17 +364,15 @@ def main():
 
     raw, status = get_data()
 
-    fetch_ts = st.session_state.get("_fetch_ts")
-    ts_str   = fetch_ts.strftime("%H:%M:%S") if fetch_ts else "—"
-    running  = st.session_state.get("_running", False)
+    last_ok  = st.session_state.get("_last_ok")
+    ts_str   = last_ok.strftime("%H:%M:%S") if last_ok else "—"
+    cached_n = len(st.session_state.get("_ev_cache", []))
 
-    if   running and not raw:  st.markdown('<span class="st-warn">● CONNESSIONE AL WEBHOOK IN CORSO…</span>', unsafe_allow_html=True)
-    elif status=="ok":         st.markdown(f'<span class="st-ok">● WEBHOOK OK — {len(raw)} eventi — aggiornato {ts_str}</span>', unsafe_allow_html=True)
-    elif status=="timeout":    st.markdown(f'<span class="st-err">● TIMEOUT — ngrok offline o lento (ultimo: {ts_str}) — riprovo tra 30s</span>', unsafe_allow_html=True)
-    elif status=="conn_error": st.markdown('<span class="st-err">● CONNESSIONE RIFIUTATA — avvia ngrok e n8n</span>', unsafe_allow_html=True)
-    elif status=="loading":    st.markdown('<span class="st-warn">● CARICAMENTO INIZIALE…</span>', unsafe_allow_html=True)
+    if   status=="ok":         st.markdown(f'<span class="st-ok">● WEBHOOK OK — {len(raw)} eventi — {datetime.utcnow().strftime("%H:%M:%S")} UTC</span>', unsafe_allow_html=True)
+    elif status=="timeout":    st.markdown(f'<span class="st-err">● TIMEOUT — ngrok lento/offline — mostro ultimi {cached_n} eventi (agg. {ts_str})</span>', unsafe_allow_html=True)
+    elif status=="conn_error": st.markdown(f'<span class="st-err">● CONNESSIONE RIFIUTATA — avvia ngrok+n8n — mostro ultimi {cached_n} eventi (agg. {ts_str})</span>', unsafe_allow_html=True)
     elif status=="empty":      st.markdown('<span class="st-warn">● WEBHOOK RAGGIUNTO — nessun dato ancora</span>', unsafe_allow_html=True)
-    else:                      st.markdown(f'<span class="st-err">● ERRORE: {status.replace("error:","")[:100]}</span>', unsafe_allow_html=True)
+    else:                      st.markdown(f'<span class="st-err">● ERRORE: {status.replace("error:","")[:120]}</span>', unsafe_allow_html=True)
 
     all_df=to_df(raw)
 
