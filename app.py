@@ -91,6 +91,37 @@ label{color:#4a5568!important;font-size:.58rem!important;letter-spacing:2px!impo
 """, unsafe_allow_html=True)
 
 # ── NON-BLOCKING FETCH ────────────────────────────────────────────────────────
+def _normalize(raw_list):
+    """
+    Handle all n8n webhook response shapes:
+      - plain list of records
+      - list of {json: {...}, pairedItem: {...}} wrappers (n8n default)
+      - single dict
+    Also remap field names to match our schema:
+      type        -> attack_type
+      tlp         -> admiralty_code  (if admiralty_code absent)
+    """
+    out = []
+    for item in raw_list:
+        # unwrap n8n pairedItem wrapper
+        if isinstance(item, dict) and "json" in item and isinstance(item["json"], dict):
+            rec = dict(item["json"])
+        elif isinstance(item, dict):
+            rec = dict(item)
+        else:
+            continue
+        # remap 'type' -> 'attack_type'
+        if "attack_type" not in rec or not rec.get("attack_type"):
+            rec["attack_type"] = rec.get("type", "")
+        # remap 'tlp' -> 'admiralty_code'
+        if "admiralty_code" not in rec or not rec.get("admiralty_code"):
+            rec["admiralty_code"] = rec.get("tlp", "")
+        # lowercase severity for consistency
+        if rec.get("severity"):
+            rec["severity"] = str(rec["severity"]).lower()
+        out.append(rec)
+    return out
+
 def _do_fetch():
     try:
         r = requests.get(WEBHOOK_URL,
@@ -98,18 +129,21 @@ def _do_fetch():
                          timeout=TIMEOUT_S)
         r.raise_for_status()
         data = r.json()
+
+        raw_list = []
         if isinstance(data, list):
-            result, status = data, "ok"
+            raw_list = data
         elif isinstance(data, dict):
-            result, status = [], "empty"
             for k in ("data","events","records","items","cyber_news"):
                 if k in data and isinstance(data[k], list):
-                    result, status = data[k], "ok"
+                    raw_list = data[k]
                     break
-            if status == "empty" and data:
-                result, status = [data], "ok"
-        else:
-            result, status = [], "empty"
+            if not raw_list:
+                raw_list = [data]
+
+        result = _normalize(raw_list)
+        status = "ok" if result else "empty"
+
     except requests.exceptions.Timeout:
         result = st.session_state.get("_ev", [])
         status = "timeout"
@@ -166,12 +200,20 @@ def to_df(events):
     df = pd.DataFrame(events)
     if "created_at" in df.columns:
         df["created_at"]=pd.to_datetime(df["created_at"],errors="coerce",utc=True)
+    # remap 'type' -> 'attack_type' if needed
+    if "attack_type" not in df.columns and "type" in df.columns:
+        df["attack_type"] = df["type"]
+    # remap 'tlp' -> 'admiralty_code' if needed
+    if "admiralty_code" not in df.columns and "tlp" in df.columns:
+        df["admiralty_code"] = df["tlp"]
     for col in ["latitude","longitude"]:
         if col not in df.columns: df[col]=float("nan")
         else: df[col]=pd.to_numeric(df[col],errors="coerce")
-    for col in ["severity","attack_type","sector","target","source","title","link","threat_actor","country"]:
+    for col in ["severity","attack_type","sector","target","source","title","link","threat_actor","country","admiralty_code"]:
         if col not in df.columns: df[col]=""
         else: df[col]=df[col].fillna("").astype(str)
+    # normalize severity to lowercase
+    df["severity"] = df["severity"].str.lower()
     return df
 
 def apply_filters(df, sv, at, se):
