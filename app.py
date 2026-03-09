@@ -5,52 +5,59 @@ import time
 
 API_URL = "https://hierocratic-subumbellate-dionna.ngrok-free.dev/webhook/cyber-news"
 
-st.set_page_config(
-    page_title="Cyber Attack Monitor",
-    layout="wide"
-)
+st.set_page_config(page_title="Cyber Attack Monitor", layout="wide")
 
 st.title("🛡️ Live Cyber Attack Feed")
+
 
 def load_news():
 
     r = requests.get(API_URL)
     data = r.json()
 
-    # se arriva un singolo oggetto lo trasformiamo in lista
-    if isinstance(data, dict):
-        data = [data]
+    rows = []
 
-    return pd.DataFrame(data)
+    for item in data:
+        if "json" in item:
+            rows.append(item["json"])
+
+    return pd.DataFrame(rows)
+
 
 df = load_news()
 
-for _, row in df.iterrows():
 
-    severity_color = {
-        "High": "red",
-        "Medium": "orange",
-        "Low": "green"
-    }.get(row.get("severity"), "white")
+if df.empty:
+    st.warning("No news available")
+else:
 
-    st.markdown(f"""
-    ### {row.get('title')}
+    for _, row in df.iterrows():
 
-    **Threat Actor:** {row.get('threat_actor')}  
-    **Target:** {row.get('target')}  
-    **Type:** {row.get('type')}  
+        severity_color = {
+            "Critical": "red",
+            "High": "red",
+            "Medium": "orange",
+            "Low": "green"
+        }.get(row["severity"], "white")
 
-    <span style="color:{severity_color}; font-weight:bold;">
-    Severity: {row.get('severity')}
-    </span>
+        st.markdown(f"""
+        ### {row['title']}
 
-    **TLP:** {row.get('tlp')}  
+        **Threat Actor:** {row['threat_actor']}  
+        **Target:** {row['target']}  
+        **Type:** {row['type']}  
 
-    [Source]({row.get('source')})
-    """, unsafe_allow_html=True)
+        <span style="color:{severity_color}; font-weight:bold;">
+        Severity: {row['severity']}
+        </span>
 
-    st.divider()
+        **TLP:** {row['tlp']}  
 
-# refresh ogni 60 secondi
+        [Source]({row['source']})
+        """, unsafe_allow_html=True)
+
+        st.divider()
+
+
 time.sleep(60)
 st.rerun()
