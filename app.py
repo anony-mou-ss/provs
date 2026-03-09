@@ -13,8 +13,13 @@ st.set_page_config(
 st.title("🛡️ Live Cyber Attack Feed")
 
 def load_news():
+
     r = requests.get(API_URL)
     data = r.json()
+
+    # se arriva un singolo oggetto lo trasformiamo in lista
+    if isinstance(data, dict):
+        data = [data]
 
     return pd.DataFrame(data)
 
@@ -26,25 +31,26 @@ for _, row in df.iterrows():
         "High": "red",
         "Medium": "orange",
         "Low": "green"
-    }.get(row["severity"], "white")
+    }.get(row.get("severity"), "white")
 
     st.markdown(f"""
-    ### {row['title']}
+    ### {row.get('title')}
 
-    **Threat Actor:** {row['threat_actor']}  
-    **Target:** {row['target']}  
-    **Type:** {row['type']}  
+    **Threat Actor:** {row.get('threat_actor')}  
+    **Target:** {row.get('target')}  
+    **Type:** {row.get('type')}  
 
     <span style="color:{severity_color}; font-weight:bold;">
-    Severity: {row['severity']}
+    Severity: {row.get('severity')}
     </span>
 
-    **TLP:** {row['tlp']}  
+    **TLP:** {row.get('tlp')}  
 
-    [Source]({row['source']})
+    [Source]({row.get('source')})
     """, unsafe_allow_html=True)
 
     st.divider()
 
+# refresh ogni 60 secondi
 time.sleep(60)
 st.rerun()
