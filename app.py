@@ -195,8 +195,9 @@ clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);background:rg
 .section-title::before{content:'';width:3px;height:11px;background:#00d4ff;display:inline-block}
 .alert-banner{background:linear-gradient(90deg,rgba(255,59,59,.15),rgba(255,59,59,.05));border:1px solid #ff3b3b;padding:10px 16px;margin-bottom:12px;font-size:.82rem;color:#ff3b3b;letter-spacing:1px}
 .feed-wrap{background:#0d1321;border:1px solid #1e2d45;max-height:230px;overflow-y:auto}
-.feed-item{display:flex;align-items:flex-start;gap:10px;padding:8px 12px;border-bottom:1px solid rgba(30,45,69,.6);text-decoration:none;color:inherit}
-.feed-item:hover{background:rgba(0,212,255,.04)}
+.feed-item{display:flex;align-items:flex-start;gap:10px;padding:8px 12px;border-bottom:1px solid rgba(30,45,69,.6);text-decoration:none;color:inherit;transition:background .15s}
+.feed-item:hover{background:rgba(0,212,255,.07)}
+.feed-item:hover .feed-title{color:#00d4ff!important;text-decoration:underline}
 .feed-dot{width:7px;min-width:7px;height:7px;border-radius:50%;margin-top:5px;flex-shrink:0}
 .feed-body{flex:1;min-width:0}
 .feed-title{font-size:.72rem;color:#e2e8f0;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -345,21 +346,22 @@ def chart_map(df):
     fig=go.Figure()
     fig.update_layout(
         geo=dict(
-            scope="europe", projection_type="natural earth",
-            center=dict(lat=42.5,lon=12.5),
-            lonaxis=dict(range=[6.0,19.5]),
-            lataxis=dict(range=[35.5,47.8]),
+            scope="europe", projection_type="mercator",
+            center=dict(lat=42.0,lon=12.5),
+            lonaxis=dict(range=[6.5,18.8]),
+            lataxis=dict(range=[36.0,47.5]),
             showland=True,       landcolor="#0d1a2d",
-            showocean=True,      oceancolor="#060d1a",
-            showlakes=True,      lakecolor="#091220",
-            showrivers=True,     rivercolor="#091220",
+            showocean=True,      oceancolor="#040810",
+            showlakes=True,      lakecolor="#081018",
+            showrivers=True,     rivercolor="#081018",
             showcountries=True,  countrycolor="#1e3a5f",
-            showcoastlines=True, coastlinecolor="#1e4070",
-            countrywidth=0.7,    coastlinewidth=0.9,
-            bgcolor="#060a14",   framewidth=0,
-            showsubunits=True,   subunitcolor="#162840",
+            showcoastlines=True, coastlinecolor="#2a5080",
+            countrywidth=0.8,    coastlinewidth=1.0,
+            bgcolor="#040810",   framewidth=0,
+            showsubunits=True,   subunitcolor="#1e3a5f",
+            resolution=50,
         ),
-        paper_bgcolor="#060a14", plot_bgcolor="#060a14",
+        paper_bgcolor="#040810", plot_bgcolor="#040810",
         margin=dict(l=0,r=0,t=0,b=0), height=460,
         font=dict(family="Share Tech Mono",color="#c9d6e8"),
         hoverlabel=dict(bgcolor="#0d1321",bordercolor="#1e2d45",
@@ -552,7 +554,13 @@ def main():
 
     all_df = to_df(raw)
 
-    # ── Filters
+    # ── Filters — reset BEFORE widgets are created to avoid StreamlitAPIException
+    if st.session_state.get("_do_reset"):
+        st.session_state["_do_reset"] = False
+        st.session_state["fsev"] = "All"
+        st.session_state["fatk"] = "All"
+        st.session_state["fsec"] = "All"
+
     fc1,fc2,fc3,fc4=st.columns([1,1,1,0.5])
     sev_opts=["All"]+[s.capitalize() for s in SEV_ORDER]
     atk_opts=["All"]+sorted({(e.get("attack_type") or "").strip().capitalize() for e in raw if e.get("attack_type")})
@@ -563,7 +571,7 @@ def main():
     with fc4:
         st.write("")
         if st.button("↺  RESET", use_container_width=True):
-            for k in ("fsev","fatk","fsec"): st.session_state[k]="All"
+            st.session_state["_do_reset"] = True
             st.rerun()
 
     df = apply_filters(all_df.copy(), sev_f, atk_f, sec_f)
@@ -620,17 +628,23 @@ def main():
             html=""
             for _,row in recent.iterrows():
                 sev=(row.get("severity") or "low").lower(); dc=SEV_COLORS.get(sev,"#7dd3fc")
-                link=str(row.get("link") or "#"); title=str(row.get("title") or "Incidente sconosciuto")[:80]
+                # Resolve best available link
+                raw_link = str(row.get("link") or row.get("source") or "").strip()
+                if raw_link and not raw_link.startswith("http"):
+                    raw_link = "https://" + raw_link
+                link = raw_link if raw_link.startswith("http") else "#"
+                title=str(row.get("title") or "Incidente sconosciuto")[:80]
                 atk=str(row.get("attack_type") or "?").capitalize(); sec=str(row.get("sector") or "?").capitalize()
                 tgt=str(row.get("target") or ""); ta=time_ago(row.get("created_at"))
                 tgt_h=f'<span style="color:#4a5568;font-size:.56rem;">→ {tgt}</span>' if tgt else ""
-                html+=(f'<a class="feed-item" href="{link}" target="_blank" rel="noopener" style="display:flex;">'
+                cursor = "pointer" if link != "#" else "default"
+                html+=(f'<a class="feed-item" href="{link}" target="_blank" rel="noopener noreferrer" style="display:flex;cursor:{cursor};">'
                        f'<div class="feed-dot" style="background:{dc};box-shadow:0 0 5px {dc};"></div>'
                        f'<div class="feed-body" style="padding-left:10px;">'
                        f'<div class="feed-title">{title}</div>'
                        f'<div class="feed-meta"><span class="feed-tag">{atk}</span>'
                        f'<span class="feed-tag-s">{sec}</span>{tgt_h}</div>'
-                       f'</div><div class="feed-time">{ta}</div></a>')
+                       f'</div><div class="feed-time" style="{"color:#00d4ff;" if link != "#" else ""}">{ta}</div></a>')
             st.markdown(f'<div class="feed-wrap">{html}</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="feed-wrap" style="padding:20px;color:#4a5568;font-size:.7rem;">In attesa di dati dal webhook…</div>', unsafe_allow_html=True)
