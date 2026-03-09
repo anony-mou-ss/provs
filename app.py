@@ -16,12 +16,7 @@ def load_news():
     r = requests.get(API_URL)
     data = r.json()
 
-    rows = []
-
-    for item in data:
-        rows.append(item["json"])
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(data)
 
 df = load_news()
 
@@ -51,6 +46,5 @@ for _, row in df.iterrows():
 
     st.divider()
 
-# refresh automatico ogni 60 secondi
 time.sleep(60)
 st.rerun()
