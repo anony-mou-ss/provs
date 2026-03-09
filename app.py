@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import time
 
-API_URL = "https://hierocratic-subumbellate-dionna.ngrok-free.dev/webhook-test/cyber-news"
+API_URL = "https://hierocratic-subumbellate-dionna.ngrok-free.dev/webhook/cyber-news"
 
 st.set_page_config(
     page_title="Cyber Attack Monitor",
