@@ -128,6 +128,9 @@ def fetch_data() -> list:
             for k in ("data", "events", "records", "items", "cyber_news"):
                 if k in data and isinstance(data[k], list):
                     return data[k]
+            # fallback: return list of values if single record dict
+            if all(not isinstance(v, dict) for v in data.values()):
+                return [data]
         return []
     except Exception as e:
         st.warning(f"Webhook error: {e}")
@@ -178,7 +181,9 @@ def to_df(events: list) -> pd.DataFrame:
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
     for col in ["latitude", "longitude"]:
-        if col in df.columns:
+        if col not in df.columns:
+            df[col] = float("nan")
+        else:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     for col in ["severity","attack_type","sector","target","source","title","link","threat_actor","country"]:
         if col not in df.columns:
@@ -261,9 +266,15 @@ def chart_severity(df):
     return fig
 
 def chart_map(df):
-    m = df.dropna(subset=["latitude","longitude"]).copy()
-    m = m[(m["latitude"].abs() > 0.01) | (m["longitude"].abs() > 0.01)]
-    if m.empty: return None
+    try:
+        if "latitude" not in df.columns or "longitude" not in df.columns:
+            return None
+        m = df.dropna(subset=["latitude","longitude"]).copy()
+        m = m[m["latitude"].notna() & m["longitude"].notna()]
+        m = m[(m["latitude"].abs() > 0.01) | (m["longitude"].abs() > 0.01)]
+        if m.empty: return None
+    except Exception:
+        return None
     m["color"] = m["severity"].str.lower().map(SEV_COLORS).fillna("#7dd3fc")
     m["size"]  = m["severity"].str.lower().map({"critical":14,"high":11,"medium":9,"low":7}).fillna(8)
     m["hover"] = ("<b>" + m["title"].str[:70] + "</b><br>"
